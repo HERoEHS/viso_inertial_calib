@@ -90,7 +90,7 @@ pip3 install matplotlib numpy scipy pyyaml
 
 cd "$ROS_WS"
 allan_ros2_path="$ROS_WS/src/edie9/edie_localization/third_party/viso_inertial_calib/external/allan_ros2"
-rosdep install --from-paths $allan_ros2_path -y --ignore-src
+rosdep install --from-paths $allan_ros2_path -y --ignore-src --skip-keys px4_msgs
 colcon build --packages-select allan_ros2
 
 source "$ROS_WS/install/setup.bash"
