@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
 set -e
 
-if [ "$#" -ne 4 ]; then
-    echo "Usage: $0 BAG_IMU BAG_CAM BAG_CAM_IMU APRILGRID_YAML" >&2
-    echo "Example: $0 imu_stationary.bag camera_intrinsics.bag vio_calibration.bag aprilgrid.yaml" >&2
-    exit 1
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+  echo "Usage: $0 BAG_IMU BAG_CAM BAG_VIO APRILGRID_YAML [MODE]" >&2
+  echo "  MODE: all (default) | allan" >&2
+  echo "Example: $0 imu_stationary.bag camera_intrinsics.bag vio_calibration.bag aprilgrid.yaml allan" >&2
+  exit 1
 fi
 
 imu_bag=$1
 cam_bag=$2
 vio_bag=$3
 april=$4
+mode=${5:-all}
+
+if [ "$mode" != "all" ] && [ "$mode" != "allan" ]; then
+  echo "Error: invalid MODE '$mode'. Use 'all' or 'allan'." >&2
+  exit 1
+fi
 
 # check if files exist
-if [ ! -f "$imu_bag" ]; then
-    echo "Error: IMU bag file '$imu_bag' not found" >&2
+if [ ! -f  "$imu_bag" ]; then
+    echo "Error: IMU bag path '$imu_bag' not found" >&2
     exit 1
 fi
 
-if [ ! -f "$cam_bag" ]; then
-    echo "Error: Camera bag file '$cam_bag' not found" >&2
+if [ ! -f  "$cam_bag" ]; then
+    echo "Error: Camera bag path '$cam_bag' not found" >&2
     exit 1
 fi
 
-if [ ! -f "$vio_bag" ]; then
-    echo "Error: VIO bag file '$vio_bag' not found" >&2
+if [ ! -f  "$vio_bag" ]; then
+    echo "Error: VIO bag path '$vio_bag' not found" >&2
     exit 1
 fi
 
@@ -34,7 +41,15 @@ if [ ! -f "$april" ]; then
 fi
 
 workdir=$(pwd)
-allan_ws=$workdir/allan_ws
+ROS_WS=${ROS_WS:-$HOME/ros2_ws}
+output_dir="$workdir/output"
+mkdir -p "$output_dir"
+
+# Make april yaml visible inside docker mount (/data)
+april_abs=$(realpath "$april")
+april_base=$(basename "$april_abs")
+cp -f "$april_abs" "$workdir/$april_base"
+april="$april_base"
 
 echo "Starting calibration..."
 echo "IMU: $imu_bag"
@@ -54,8 +69,8 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# convert bags to ros1
-echo "Converting bags..."
+# ROS2 bag → ROS1 bag 변환 (Kalibr는 ROS1 bag만 지원)
+echo "Converting bags to ROS1 format..."
 ros1_cam="cam_ros1.bag"
 ros1_vio="vio_ros1.bag"
 
@@ -66,70 +81,67 @@ echo "Bags converted."
 echo ""
 
 # allan variance setup
-echo "Setting up allan variance..."
-mkdir -p "$allan_ws/src"
-if [ ! -d "$allan_ws/src/allan_ros2" ]; then
-    cp -r "$workdir/external/allan_ros2" "$allan_ws/src/allan_ros2"
-fi
+echo "Running allan variance using existing workspace: $ROS_WS"
 
-# config for allan
-cat > "$allan_ws/src/allan_ros2/config/config.yaml" <<EOF
+# params file for allan (공통 사용: ROS2 노드 + analysis.py)
+# 기존 예제 파일(external/allan_ros2/config/config.yaml)을 실행 시점에 덮어써서 사용
+allan_cfg="$workdir/external/allan_ros2/config/config.yaml"
+cat > "$allan_cfg" <<EOF
 allan_node:
   ros__parameters:
-    topic: /imu
+    topic: /edie/sensor/lpf_imu
     bag_path: $imu_bag
     msg_type: ros
-    publish_rate: 200
-    sample_rate: 200
+    publish_rate: 400
+    sample_rate: 400
 EOF
 
-# install deps
+# build in existing ROS2 workspace (no allan_ws)
 pip3 install matplotlib numpy scipy pyyaml
 
-cd "$allan_ws"
-rosdep install --from-paths src -y --ignore-src
-
-echo "Building..."
+cd "$ROS_WS"
+allan_ros2_path="$ROS_WS/src/edie9/edie_localization/third_party/viso_inertial_calib/external/allan_ros2"
+rosdep install --from-paths $allan_ros2_path -y --ignore-src
 colcon build --packages-select allan_ros2
 
-if [ $? -ne 0 ]; then
-    echo "Build failed" >&2
-    exit 1
-fi
+source "$ROS_WS/install/setup.bash"
 
-echo "Build done."
-echo ""
-
-source install/setup.bash
-
-# run allan analysis
+# run allan analysis from output_dir so deviation.csv, plots, imu.yaml 모두 그 안에 생성되도록
+cd "$output_dir"
 echo "Running allan variance..."
-echo "This might take a while..."
-
-ros2 launch allan_ros2 allan_node.py &
+ros2 run allan_ros2 allan_node --ros-args --params-file "$allan_cfg" &
 allan_pid=$!
 
 sleep 10
-
 if ! kill -0 $allan_pid 2>/dev/null; then
     echo "allan node crashed" >&2
     exit 1
 fi
 
-echo "Analysis running..."
-wait $allan_pid
+# deviation.csv가 만들어질 때까지 대기(비어있지 않게 -s)
+while [ ! -s "$output_dir/deviation.csv" ]; do
+  sleep 1
+done
+
+# 파일 flush 시간 조금 주고, 노드 종료
+sleep 2
+kill -INT $allan_pid 2>/dev/null || true
+wait $allan_pid 2>/dev/null || true
 
 echo "Allan done."
-echo ""
 
 # generate imu calib
 echo "Generating IMU params..."
-if [ -f "deviation.csv" ]; then
-    python3 src/allan_ros2/scripts/analysis.py --data deviation.csv --config src/allan_ros2/config/config.yaml
-    
-    if [ -f "imu.yaml" ]; then
+if [ -f "$output_dir/deviation.csv" ]; then
+    # output_dir 안에서 실행하여 imu.yaml, acceleration.png, gyro.png 모두 output_dir에 생성
+    cd "$output_dir"
+    python3 "$workdir/external/allan_ros2/scripts/analysis.py" --data deviation.csv --config "$allan_cfg"
+
+    if [ -f "$output_dir/imu.yaml" ]; then
         echo "IMU calib generated."
-        cp imu.yaml "$workdir/imu.yaml"
+        # Kalibr 등 기존 파이프라인 호환을 위해 workdir 루트에도 복사
+        cp "$output_dir/imu.yaml" "$workdir/imu.yaml"
+        cd "$workdir"
     else
         echo "Failed to generate imu.yaml" >&2
         exit 1
@@ -139,8 +151,17 @@ else
     exit 1
 fi
 
-cd "$workdir"
 echo ""
+# MODE이 allan이면 여기서 종료 (카메라/VIO 캘립 생략)
+if [ "$mode" = "allan" ]; then
+    echo "Allan variance analysis finished."
+    echo "Skipping camera and VIO calibration (mode=allan)."
+    echo ""
+    echo "Cleaning up..."
+    rm -f "$ros1_cam" "$ros1_vio"
+    echo "Done!"
+    exit 0
+fi
 
 # camera calib
 echo "Camera calibration..."
@@ -211,6 +232,5 @@ echo ""
 # cleanup
 echo "Cleaning up..."
 rm -f "$ros1_cam" "$ros1_vio"
-rm -rf "$allan_ws"
 
 echo "Done!"

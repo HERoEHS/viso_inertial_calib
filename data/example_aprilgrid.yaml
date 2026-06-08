@@ -5,7 +5,7 @@ target_type: 'aprilgrid'
 tagCols: 6          # Number of columns in the grid
 tagRows: 6          # Number of rows in the grid
 tagSize: 0.088      # Size of each AprilTag in meters (8.8 cm)
-tagSpacing: 0.3     # Spacing between tags in meters (30 cm)
+tagSpacing: 0.3     # tagSize에 대한 “비율(무차원)”
 
 # Alternative configurations for different grid sizes:
 # 
