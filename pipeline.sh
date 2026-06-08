@@ -112,9 +112,11 @@ while [ ! -s "$output_dir/deviation.csv" ]; do
   sleep 1
 done
 
-# 파일 flush 시간 조금 주고, 노드 종료
+# 파일 flush 시간 조금 주고, 노드 강제 종료
 sleep 2
 kill -INT $allan_pid 2>/dev/null || true
+sleep 2
+kill -9 $allan_pid 2>/dev/null || true  # SIGINT 무시 시 강제 종료
 wait $allan_pid 2>/dev/null || true
 
 echo "Allan done."
