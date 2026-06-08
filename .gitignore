@@ -2,3 +2,5 @@ allan_ws/
 camchain*.yaml
 imu.yaml
 __pycache__/
+
+.omc/
