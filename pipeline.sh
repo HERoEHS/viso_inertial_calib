@@ -69,17 +69,6 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# ROS2 bag → ROS1 bag 변환 (Kalibr는 ROS1 bag만 지원)
-echo "Converting bags to ROS1 format..."
-ros1_cam="cam_ros1.bag"
-ros1_vio="vio_ros1.bag"
-
-rosbags-convert --src "$cam_bag" --dst "$ros1_cam"
-rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
-
-echo "Bags converted."
-echo ""
-
 # allan variance setup
 echo "Running allan variance using existing workspace: $ROS_WS"
 
@@ -156,12 +145,20 @@ echo ""
 if [ "$mode" = "allan" ]; then
     echo "Allan variance analysis finished."
     echo "Skipping camera and VIO calibration (mode=allan)."
-    echo ""
-    echo "Cleaning up..."
-    rm -f "$ros1_cam" "$ros1_vio"
     echo "Done!"
     exit 0
 fi
+
+# ROS2 bag → ROS1 bag 변환 (Kalibr는 ROS1 bag만 지원)
+echo "Converting bags to ROS1 format..."
+ros1_cam="cam_ros1.bag"
+ros1_vio="vio_ros1.bag"
+
+rosbags-convert --src "$cam_bag" --dst "$ros1_cam"
+rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
+
+echo "Bags converted."
+echo ""
 
 # camera calib
 echo "Camera calibration..."
