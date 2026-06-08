@@ -4,3 +4,4 @@ imu.yaml
 __pycache__/
 
 .omc/
+.bkit/
