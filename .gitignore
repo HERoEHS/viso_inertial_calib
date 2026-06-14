@@ -5,3 +5,8 @@ __pycache__/
 
 .omc/
 .bkit/
+
+data/
+backup/
+best_so_far/
+output/
