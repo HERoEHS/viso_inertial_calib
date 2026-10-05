@@ -30,6 +30,16 @@ cd viso_inertial_calib
 ./setup.sh
 ```
 
+> **EDIE(HERoEHS) 사용 시** — 안쪽 서브모듈 kalibr·allan_ros2 는 EDIE 수정 커밋이 들어 있는 HERoEHS 포크의 `edie9` 브랜치를 쓴다(`.gitmodules`).
+> 원본 저장소에는 이 커밋이 없어서 원본 주소로는 `--recursive` 갱신이 실패한다. 모든 주소는 https 라 ssh 키 없는 로봇에서도 받을 수 있다.
+> 이미 클론해 둔 곳(PC·로봇)은 주소를 새로 맞춘 뒤 갱신한다:
+>
+> ```bash
+> git submodule sync --recursive && git submodule update --init --recursive
+> ```
+>
+> 캘리브레이션 데이터(`data/`, `best_so_far/`, `backup/`, `camchain*.yaml` 등)는 `.gitignore` 로 git 밖에 둔다 — 장비 사이에는 따로 옮긴다.
+
 ### 2. Prepare Your Data
 
 You need three ROS2 bag files:

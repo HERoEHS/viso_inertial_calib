@@ -1,9 +1,11 @@
 [submodule "external/kalibr"]
 	path = external/kalibr
-	url = https://github.com/ethz-asl/kalibr.git
+	url = https://github.com/HERoEHS/kalibr.git
+	branch = edie9
 [submodule "external/allan_ros2"]
 	path = external/allan_ros2
-	url = https://github.com/CruxDevStuff/allan_ros2.git
+	url = https://github.com/HERoEHS/allan_ros2.git
+	branch = edie9
 [submodule "external/px4_msgs"]
 	path = external/px4_msgs
-	url = git@github.com:PX4/px4_msgs.git
+	url = https://github.com/PX4/px4_msgs.git
