@@ -87,23 +87,28 @@ echo ""
 #   --imucam: 이번 실행(run_marker 이후)이 만든 Kalibr 결과 <bag>-camchain-imucam.yaml·<bag>-results-imucam.txt·<bag>-imu.yaml
 publish_results() {
     mkdir -p "$calib_dir"
-    local f found=0
+    local f kf missing_imucam=0 found
     for f in "$@"; do
         if [ "$f" = "--imucam" ]; then
-            while IFS= read -r f; do
-                cp -f "$f" "$calib_dir/"
-                echo "  게시: $(basename "$f")"
+            found=0
+            while IFS= read -r kf; do
+                cp -f "$kf" "$calib_dir/"
+                echo "  게시: $(basename "$kf")"
                 found=1
             done < <(find "$workdir" -maxdepth 1 -newer "$run_marker" \( -name '*-camchain-imucam.yaml' -o -name '*-results-imucam.txt' -o -name '*-imu.yaml' \) | sort)
             if [ "$found" -eq 0 ]; then
-                echo "Warning: 이번 실행이 만든 Kalibr 결과(*-camchain-imucam.yaml 등)를 $workdir 에서 못 찾았습니다 — 게시하지 않았습니다." >&2
+                echo "Error: 이번 실행이 만든 Kalibr 결과(<bag>-camchain-imucam.yaml 등)를 $workdir 에서 못 찾았습니다 — Kalibr 가 결과를 쓰지 않았습니다." >&2
+                missing_imucam=1
             fi
         elif [ -f "$workdir/$f" ]; then
             cp -f "$workdir/$f" "$calib_dir/$f"
             echo "  게시: $f"
+        else
+            echo "  게시 안 함(실행 폴더에 없음): $f"
         fi
     done
     echo "결과 게시 위치: $calib_dir (EDIE_CALIB_DIR 로 바꿀 수 있음)"
+    return $missing_imucam
 }
 
 # check tools — Docker·rosbags-convert 는 Kalibr 단계에서만 쓴다. allan 모드는 둘 다 없어도 돈다(Docker 없는 로봇).
@@ -111,7 +116,8 @@ if [ "$mode" != "allan" ]; then
     if ! command -v "$DOCKER" &> /dev/null; then
         echo "Error: Kalibr 계산에는 Docker 와 kalibr:ros1 이미지가 필요한데 이 장비($(uname -m))에 '$DOCKER' 가 없습니다." >&2
         if [ "$mode" = "all" ]; then
-            echo "  로봇이라면: 먼저 MODE=allan 으로 imu.yaml 을 만들고, 카메라 bag·VIO bag·imu.yaml 을 PC 실행 폴더로 옮겨 PC 에서 실행하세요." >&2
+            echo "  로봇이라면: all 은 IMU 정지 bag·카메라 bag·VIO bag 이 모두 필요합니다(allan 을 다시 돕니다). 세 bag 을 PC 로 옮겨 PC 에서 실행하거나," >&2
+            echo "  로봇에서는 MODE=allan 으로 imu.yaml 만 만들고, VIO bag·imu.yaml·$camchain_file 을 PC 로 옮겨 MODE=kalibr 로 실행하세요." >&2
         else
             echo "  로봇이라면: VIO bag 과 imu.yaml·$camchain_file 을 PC 실행 폴더로 옮겨 PC 에서 같은 명령(MODE=$mode)을 실행하세요." >&2
         fi
@@ -154,6 +160,10 @@ allan_prefix=$(ros2 pkg prefix allan_ros2 2>/dev/null || true)
 if [ -z "$allan_prefix" ] || [ "${ALLAN_REBUILD:-0}" = "1" ]; then
     # 소스 체크아웃에서만 가능한 경로 — 스크립트 옆의 external/allan_ros2 만 골라 ROS_WS 에 빌드한다
     allan_ros2_path="$script_dir/external/allan_ros2"
+    if [ ! -f "$allan_ros2_path/package.xml" ]; then
+        echo "Error: allan_ros2 를 빌드할 소스가 없습니다($allan_ros2_path). git submodule update --init external/allan_ros2 를 하세요." >&2
+        exit 1
+    fi
     echo "allan_ros2 빌드: $allan_ros2_path → $ROS_WS/install"
     (cd "$ROS_WS" && rosdep install --from-paths "$allan_ros2_path" -y --ignore-src --skip-keys px4_msgs \
         && colcon build --symlink-install --base-paths "$allan_ros2_path" --packages-select allan_ros2)
@@ -164,6 +174,13 @@ allan_bin="$allan_prefix/lib/allan_ros2/allan_node"
 echo "allan_node: $allan_bin ($(date -r "$allan_bin" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '시각 모름'))"
 if [ ! -f "$allan_prefix/lib/allan_ros2/analysis.py" ]; then
     echo "Warning: 설치된 allan_ros2 가 옛 빌드입니다(analysis.py 미설치 = HERoEHS edie9 515693f 이전). ALLAN_REBUILD=1 로 다시 빌드하세요." >&2
+fi
+analysis_py="$allan_prefix/lib/allan_ros2/analysis.py"
+[ -f "$analysis_py" ] || analysis_py="$script_dir/external/allan_ros2/scripts/analysis.py"
+if [ ! -f "$analysis_py" ]; then
+    echo "Error: analysis.py 를 찾지 못했습니다 — 설치본(옛 빌드)에도, 스크립트 옆 external/allan_ros2 에도 없습니다." >&2
+    echo "  ALLAN_REBUILD=1 로 다시 빌드하거나 git submodule update --init external/allan_ros2 를 하세요." >&2
+    exit 1
 fi
 echo "Running allan variance"
 
@@ -178,7 +195,10 @@ if [ -n "${IMU_RATE:-}" ]; then
 else
 echo "Detecting actual IMU sample rate from bag..."
 imu_rate=$(python3 - <<PYEOF
-import sys
+import os, sys
+# rosbag2(C++) 가 stdout 에 "closing." 같은 줄을 찍어 결과를 오염시킨다 → 표준출력을 stderr 로 돌리고 결과만 원래 출력으로
+_result_fd = os.dup(1)
+os.dup2(2, 1)
 def stamps_rosbags(path, topic):
     from rosbags.rosbag2 import Reader
     from rosbags.typesys import Stores, get_typestore
@@ -216,7 +236,7 @@ for fn in (stamps_rosbags, stamps_rosbag2_py):
     try:
         ts = fn("$imu_bag", "$imu_topic")
         if len(ts) >= 10:
-            print(round(1e9 / np.mean(np.diff(ts[:5000]))), end='')
+            os.write(_result_fd, str(round(1e9 / np.mean(np.diff(ts[:5000])))).encode())
             sys.exit(0)
     except Exception as e:
         print(f"[rate] {fn.__name__} 실패: {e}", file=sys.stderr)
@@ -225,6 +245,9 @@ sys.exit(2)
 PYEOF
 ) || { echo "Error: IMU 주기 측정 실패(위 [rate] 메시지 참고)" >&2; exit 1; }
 fi
+case "$imu_rate" in
+    ''|*[!0-9]*) echo "Error: IMU 주기 값이 정수가 아닙니다: '$imu_rate'" >&2; exit 1 ;;
+esac
 echo "Detected IMU rate: ${imu_rate} Hz"
 
 cat > "$allan_cfg" <<EOF
@@ -245,7 +268,8 @@ rm -f "$output_dir/deviation.csv"
 # 래퍼만 죽고 allan_node 가 고아로 남았다(약 0.5 GB). $! 가 노드 자신이어야 아래 종료가 닿는다.
 "$allan_bin" --ros-args --params-file "$allan_cfg" &
 allan_pid=$!
-trap 'kill -INT $allan_pid 2>/dev/null || true' EXIT  # 중간에 실패해도 노드를 남기지 않는다
+# 중간에 실패해도 노드를 남기지 않는다 — 계산 중엔 SIGINT 를 늦게 받으므로 잠시 뒤 강제 종료
+trap 'kill -INT $allan_pid 2>/dev/null; sleep 1; kill -9 $allan_pid 2>/dev/null || true' EXIT
 
 # deviation.csv 가 만들어질 때까지 대기 — 노드가 먼저 끝나거나 상한(ALLAN_TIMEOUT 초)을 넘으면 실패
 allan_timeout=${ALLAN_TIMEOUT:-1800}
@@ -278,13 +302,6 @@ echo "Generating IMU params..."
 if [ -f "$output_dir/deviation.csv" ]; then
     # output_dir 안에서 실행하여 imu.yaml, acceleration.png, gyro.png 모두 output_dir에 생성
     cd "$output_dir"
-    analysis_py="$allan_prefix/lib/allan_ros2/analysis.py"
-    [ -f "$analysis_py" ] || analysis_py="$script_dir/external/allan_ros2/scripts/analysis.py"
-    if [ ! -f "$analysis_py" ]; then
-        echo "Error: analysis.py 를 찾지 못했습니다 — 설치본(옛 빌드)에도, 스크립트 옆 external/allan_ros2 에도 없습니다." >&2
-        echo "  ALLAN_REBUILD=1 로 다시 빌드하거나 git submodule update --init external/allan_ros2 를 하세요." >&2
-        exit 1
-    fi
     python3 "$analysis_py" --data deviation.csv --config "$allan_cfg"
 
     if [ -f "$output_dir/imu.yaml" ]; then

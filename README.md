@@ -48,12 +48,14 @@ cd viso_inertial_calib
 >   - 노드가 `ALLAN_TIMEOUT`(기본 1800 s) 안에 결과를 못 내면 멈춘다.
 > - `kalibr`·`sweep`·`all` 모드는 Docker 와 `kalibr:ros1`(ROS1) 이미지가 필요하다. 기본은 **PC 에서 계산**한다. Docker 가 없는 장비에서는 무엇을 옮길지 안내하고 멈춘다(arm64 이미지 빌드는 검증 안 됨).
 >   - kalibr·sweep: VIO bag 과 실행 폴더의 `imu.yaml`(로봇 allan 결과)·`camchain.yaml` 이 PC 실행 폴더에 있어야 한다.
->   - all: 카메라 bag·VIO bag·IMU 정지 bag 이 필요하다(로봇에서는 allan 만 먼저 돌리고 나머지는 PC 로).
+>   - all: IMU 정지 bag·카메라 bag·VIO bag 이 모두 필요하고 allan 을 다시 돈다. 로봇에서는 `MODE=allan` 으로 imu.yaml 만 만들고, PC 에서는 `MODE=kalibr` 로 이어 가면 된다.
 > - 결과는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본 `~/.edie/calib`)** 에도 복사된다. 모드마다 이번 실행에서 만들거나 쓴 것만 복사한다.
 >   - allan: `imu.yaml`
 >   - kalibr: `imu.yaml`·`$CAMCHAIN_FILE`(기본 `camchain.yaml`)·이번 실행이 만든 `<bag>-camchain-imucam.yaml`·`<bag>-results-imucam.txt`·`<bag>-imu.yaml`
 >   - all: `imu.yaml`·`camchain.yaml`·위 Kalibr 결과
 >   - sweep: 복사하지 않음(탐색용)
+>   - 결과를 쓰는 쪽(VINS 설정 등)은 `<bag>-camchain-imucam.yaml`(내부 파라미터 + T_cam_imu 포함)을 기준으로 읽는다. `$CAMCHAIN_FILE` 은 자기 이름 그대로 복사되므로 예전 `camchain.yaml` 과 함께 있을 수 있다.
+>   - kalibr·all 에서 이번 실행이 만든 Kalibr 결과가 없으면 오류로 끝난다.
 > - allan 파라미터는 실행할 때 `output/allan_params.yaml` 로 새로 만든다(저장소의 `external/allan_ros2/config/config.yaml` 은 건드리지 않는다).
 
 ### 2. Prepare Your Data
