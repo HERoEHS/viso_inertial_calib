@@ -58,6 +58,9 @@ DOCKER=${DOCKER:-docker}
 camchain_file=${CAMCHAIN_FILE:-camchain.yaml}  # 환경변수로 override 가능: CAMCHAIN_FILE=camchain_raw.yaml
 output_dir="$workdir/output"
 mkdir -p "$output_dir"
+# 이번 실행 시작 표식 — 게시할 Kalibr 결과를 "이 실행이 만든 것"으로 한정한다(옛 결과가 장비 캘리브 자리를 덮지 않게)
+run_marker="$output_dir/.run_start"
+touch "$run_marker"
 
 # AprilGrid yaml은 allan 모드에서 불필요 — kalibr/all 모드에서만 검사
 if [ "$mode" != "allan" ]; then
@@ -79,25 +82,40 @@ echo "Grid: $april"
 echo ""
 
 # 결과를 장비별 캘리브 자리(calib_dir)에도 둔다 — PC 에서 계산한 결과를 로봇에 넣을 때도 같은 경로를 쓰게.
+# 사용: publish_results <실행 폴더의 파일 이름...> [--imucam]
+#   모드마다 이번에 실제로 만들거나 쓴 파일만 넘긴다(allan → imu.yaml 하나). 실행 폴더의 옛 파일이 더 새 값을 덮지 않게.
+#   --imucam: 이번 실행(run_marker 이후)이 만든 Kalibr 결과 <bag>-camchain-imucam.yaml·<bag>-results-imucam.txt·<bag>-imu.yaml
 publish_results() {
     mkdir -p "$calib_dir"
-    local f latest
-    for f in imu.yaml camchain.yaml; do
-        [ -f "$workdir/$f" ] && cp -f "$workdir/$f" "$calib_dir/$f"
+    local f found=0
+    for f in "$@"; do
+        if [ "$f" = "--imucam" ]; then
+            while IFS= read -r f; do
+                cp -f "$f" "$calib_dir/"
+                echo "  게시: $(basename "$f")"
+                found=1
+            done < <(find "$workdir" -maxdepth 1 -newer "$run_marker" \( -name '*-camchain-imucam.yaml' -o -name '*-results-imucam.txt' -o -name '*-imu.yaml' \) | sort)
+            if [ "$found" -eq 0 ]; then
+                echo "Warning: 이번 실행이 만든 Kalibr 결과(*-camchain-imucam.yaml 등)를 $workdir 에서 못 찾았습니다 — 게시하지 않았습니다." >&2
+            fi
+        elif [ -f "$workdir/$f" ]; then
+            cp -f "$workdir/$f" "$calib_dir/$f"
+            echo "  게시: $f"
+        fi
     done
-    for pat in 'camchain-imucam-*.yaml' 'results-imucam-*.txt'; do
-        latest=$(ls -t "$workdir"/$pat 2>/dev/null | head -1 || true)
-        [ -n "$latest" ] && cp -f "$latest" "$calib_dir/"
-    done
-    echo "결과 복사: $calib_dir (EDIE_CALIB_DIR 로 바꿀 수 있음)"
+    echo "결과 게시 위치: $calib_dir (EDIE_CALIB_DIR 로 바꿀 수 있음)"
 }
 
 # check tools — Docker·rosbags-convert 는 Kalibr 단계에서만 쓴다. allan 모드는 둘 다 없어도 돈다(Docker 없는 로봇).
 if [ "$mode" != "allan" ]; then
     if ! command -v "$DOCKER" &> /dev/null; then
         echo "Error: Kalibr 계산에는 Docker 와 kalibr:ros1 이미지가 필요한데 이 장비($(uname -m))에 '$DOCKER' 가 없습니다." >&2
-        echo "  로봇이라면: 녹화한 VIO bag 을 PC 로 옮겨 PC 에서 같은 명령(MODE=$mode)을 실행하세요." >&2
-        echo "  결과(camchain-imucam-*.yaml 등)는 로봇의 \$EDIE_CALIB_DIR(기본 ~/.edie/calib)에 두면 됩니다." >&2
+        if [ "$mode" = "all" ]; then
+            echo "  로봇이라면: 먼저 MODE=allan 으로 imu.yaml 을 만들고, 카메라 bag·VIO bag·imu.yaml 을 PC 실행 폴더로 옮겨 PC 에서 실행하세요." >&2
+        else
+            echo "  로봇이라면: VIO bag 과 imu.yaml·$camchain_file 을 PC 실행 폴더로 옮겨 PC 에서 같은 명령(MODE=$mode)을 실행하세요." >&2
+        fi
+        echo "  결과(<bag>-camchain-imucam.yaml·<bag>-results-imucam.txt)는 로봇의 \$EDIE_CALIB_DIR(기본 ~/.edie/calib)에 두면 됩니다." >&2
         exit 1
     fi
     if ! command -v rosbags-convert &> /dev/null; then
@@ -123,13 +141,41 @@ if [ "$mode" = "kalibr" ] || [ "$mode" = "sweep" ]; then
 else
 
 # allan variance setup
-echo "Running allan variance using existing workspace: $ROS_WS"
+# allan_ros2·파이썬 의존성 준비 — 주기 측정(rosbag2_py)도 ROS 환경이 필요하므로 가장 먼저 한다.
+# 이미 설치돼 있으면(로봇·install-only 배포) 실행 중 pip·colcon 을 하지 않는다.
+if [ -z "$(command -v ros2)" ] && [ -f "$ROS_WS/install/setup.bash" ]; then
+    source "$ROS_WS/install/setup.bash"
+fi
+if ! python3 -c "import matplotlib, numpy, scipy, yaml" 2>/dev/null; then
+    echo "analysis.py 의존 모듈 설치(matplotlib numpy scipy pyyaml)..."
+    pip3 install matplotlib numpy scipy pyyaml
+fi
+allan_prefix=$(ros2 pkg prefix allan_ros2 2>/dev/null || true)
+if [ -z "$allan_prefix" ] || [ "${ALLAN_REBUILD:-0}" = "1" ]; then
+    # 소스 체크아웃에서만 가능한 경로 — 스크립트 옆의 external/allan_ros2 만 골라 ROS_WS 에 빌드한다
+    allan_ros2_path="$script_dir/external/allan_ros2"
+    echo "allan_ros2 빌드: $allan_ros2_path → $ROS_WS/install"
+    (cd "$ROS_WS" && rosdep install --from-paths "$allan_ros2_path" -y --ignore-src --skip-keys px4_msgs \
+        && colcon build --symlink-install --base-paths "$allan_ros2_path" --packages-select allan_ros2)
+    source "$ROS_WS/install/setup.bash"
+    allan_prefix=$(ros2 pkg prefix allan_ros2)
+fi
+allan_bin="$allan_prefix/lib/allan_ros2/allan_node"
+echo "allan_node: $allan_bin ($(date -r "$allan_bin" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '시각 모름'))"
+if [ ! -f "$allan_prefix/lib/allan_ros2/analysis.py" ]; then
+    echo "Warning: 설치된 allan_ros2 가 옛 빌드입니다(analysis.py 미설치 = HERoEHS edie9 515693f 이전). ALLAN_REBUILD=1 로 다시 빌드하세요." >&2
+fi
+echo "Running allan variance"
 
 # params file for allan (공통 사용: ROS2 노드 + analysis.py)
 # 결과 폴더에 새로 만든다 — 저장소 안 config.yaml 을 덮어쓰면 git 이 더러워지고, 설치본(share)은 읽기 전용이다.
 allan_cfg="$output_dir/allan_params.yaml"
 
-# bag에서 실제 샘플레이트 자동 계산 (header.stamp 기준)
+# bag에서 실제 샘플레이트 자동 계산 (header.stamp 기준). IMU_RATE=<Hz> 로 직접 줄 수도 있다.
+if [ -n "${IMU_RATE:-}" ]; then
+    imu_rate=$IMU_RATE
+    echo "IMU rate: ${imu_rate} Hz (IMU_RATE 지정)"
+else
 echo "Detecting actual IMU sample rate from bag..."
 imu_rate=$(python3 - <<PYEOF
 import sys
@@ -140,6 +186,8 @@ def stamps_rosbags(path, topic):
     ts = []
     with Reader(path) as r:
         conns = [c for c in r.connections if c.topic == topic]
+        if not conns:  # 빈 목록이면 rosbags 가 "필터 없음"으로 모든 토픽을 읽는다 — 반드시 막는다
+            raise LookupError(f"bag 에 토픽 {topic} 없음 (있는 토픽: {sorted({c.topic for c in r.connections})})")
         for conn, t, raw in r.messages(connections=conns):
             msg = typestore.deserialize_cdr(raw, conn.msgtype)
             ts.append(msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec)
@@ -152,7 +200,10 @@ def stamps_rosbag2_py(path, topic):
     from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import Imu
     r = rosbag2_py.SequentialReader()
-    r.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"), rosbag2_py.ConverterOptions("", ""))
+    r.open(rosbag2_py.StorageOptions(uri=path, storage_id=""), rosbag2_py.ConverterOptions("", ""))
+    topics = sorted(t.name for t in r.get_all_topics_and_types())
+    if topic not in topics:
+        raise LookupError(f"bag 에 토픽 {topic} 없음 (있는 토픽: {topics})")
     r.set_filter(rosbag2_py.StorageFilter(topics=[topic]))
     ts = []
     while r.has_next() and len(ts) <= 5000:
@@ -169,10 +220,11 @@ for fn in (stamps_rosbags, stamps_rosbag2_py):
             sys.exit(0)
     except Exception as e:
         print(f"[rate] {fn.__name__} 실패: {e}", file=sys.stderr)
-print("[rate] WARN: bag 에서 주기를 못 재서 400 Hz 로 둡니다 — 결과 imu.yaml 이 틀릴 수 있습니다", file=sys.stderr)
-print(400, end='')
+print("[rate] Error: bag 에서 IMU 주기를 재지 못했습니다 — 토픽 이름을 확인하거나 IMU_RATE=<Hz> 로 지정하세요", file=sys.stderr)
+sys.exit(2)
 PYEOF
-)
+) || { echo "Error: IMU 주기 측정 실패(위 [rate] 메시지 참고)" >&2; exit 1; }
+fi
 echo "Detected IMU rate: ${imu_rate} Hz"
 
 cat > "$allan_cfg" <<EOF
@@ -185,46 +237,39 @@ allan_node:
     sample_rate: $imu_rate
 EOF
 
-# allan_ros2 준비 — 이미 설치돼 있으면(로봇·install-only 배포) 실행 중 pip·colcon 을 하지 않는다.
-[ -z "$(command -v ros2)" ] && [ -f "$ROS_WS/install/setup.bash" ] && source "$ROS_WS/install/setup.bash"
-if ! python3 -c "import matplotlib, numpy, scipy, yaml" 2>/dev/null; then
-    echo "analysis.py 의존 모듈 설치(matplotlib numpy scipy pyyaml)..."
-    pip3 install matplotlib numpy scipy pyyaml
-fi
-if ros2 pkg prefix allan_ros2 > /dev/null 2>&1; then
-    echo "allan_ros2: 설치본 사용 ($(ros2 pkg prefix allan_ros2))"
-else
-    # 소스 체크아웃에서만 가능한 경로 — 스크립트 옆의 external/allan_ros2 를 ROS_WS 에서 빌드한다
-    echo "allan_ros2 가 설치돼 있지 않아 $ROS_WS 에서 빌드합니다..."
-    allan_ros2_path="$script_dir/external/allan_ros2"
-    (cd "$ROS_WS" && rosdep install --from-paths "$allan_ros2_path" -y --ignore-src --skip-keys px4_msgs \
-        && colcon build --symlink-install --packages-select allan_ros2)
-    source "$ROS_WS/install/setup.bash"
-fi
-
 # run allan analysis from output_dir so deviation.csv, plots, imu.yaml 모두 그 안에 생성되도록
 cd "$output_dir"
 echo "Running allan variance..."
-ros2 run allan_ros2 allan_node --ros-args --params-file "$allan_cfg" &
+rm -f "$output_dir/deviation.csv"
+# 'ros2 run' 래퍼를 거치지 않고 바이너리를 직접 띄운다 — 래퍼는 SIGINT 를 자식에게 넘기지 않아
+# 래퍼만 죽고 allan_node 가 고아로 남았다(약 0.5 GB). $! 가 노드 자신이어야 아래 종료가 닿는다.
+"$allan_bin" --ros-args --params-file "$allan_cfg" &
 allan_pid=$!
+trap 'kill -INT $allan_pid 2>/dev/null || true' EXIT  # 중간에 실패해도 노드를 남기지 않는다
 
-sleep 10
-if ! kill -0 $allan_pid 2>/dev/null; then
-    echo "allan node crashed" >&2
-    exit 1
-fi
-
-# deviation.csv가 만들어질 때까지 대기(비어있지 않게 -s)
+# deviation.csv 가 만들어질 때까지 대기 — 노드가 먼저 끝나거나 상한(ALLAN_TIMEOUT 초)을 넘으면 실패
+allan_timeout=${ALLAN_TIMEOUT:-1800}
+waited=0
 while [ ! -s "$output_dir/deviation.csv" ]; do
-  sleep 1
+    if ! kill -0 $allan_pid 2>/dev/null; then
+        echo "Error: allan_node 가 deviation.csv 없이 끝났습니다(토픽·bag 경로 확인)" >&2
+        exit 1
+    fi
+    if [ "$waited" -ge "$allan_timeout" ]; then
+        echo "Error: ${allan_timeout}s 안에 deviation.csv 가 생기지 않았습니다(ALLAN_TIMEOUT 으로 늘릴 수 있음)" >&2
+        exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
 done
 
-# 파일 flush 시간 조금 주고, 노드 강제 종료
+# 파일 flush 시간 조금 주고 노드 종료(SIGINT → rclcpp 정상 종료, 안 되면 강제)
 sleep 2
 kill -INT $allan_pid 2>/dev/null || true
-sleep 2
-kill -9 $allan_pid 2>/dev/null || true  # SIGINT 무시 시 강제 종료
+for _ in 1 2 3 4 5; do kill -0 $allan_pid 2>/dev/null || break; sleep 1; done
+kill -9 $allan_pid 2>/dev/null || true
 wait $allan_pid 2>/dev/null || true
+trap - EXIT
 
 echo "Allan done."
 
@@ -233,8 +278,13 @@ echo "Generating IMU params..."
 if [ -f "$output_dir/deviation.csv" ]; then
     # output_dir 안에서 실행하여 imu.yaml, acceleration.png, gyro.png 모두 output_dir에 생성
     cd "$output_dir"
-    analysis_py="$(ros2 pkg prefix allan_ros2 2>/dev/null)/lib/allan_ros2/analysis.py"
+    analysis_py="$allan_prefix/lib/allan_ros2/analysis.py"
     [ -f "$analysis_py" ] || analysis_py="$script_dir/external/allan_ros2/scripts/analysis.py"
+    if [ ! -f "$analysis_py" ]; then
+        echo "Error: analysis.py 를 찾지 못했습니다 — 설치본(옛 빌드)에도, 스크립트 옆 external/allan_ros2 에도 없습니다." >&2
+        echo "  ALLAN_REBUILD=1 로 다시 빌드하거나 git submodule update --init external/allan_ros2 를 하세요." >&2
+        exit 1
+    fi
     python3 "$analysis_py" --data deviation.csv --config "$allan_cfg"
 
     if [ -f "$output_dir/imu.yaml" ]; then
@@ -256,7 +306,7 @@ echo ""
 if [ "$mode" = "allan" ]; then
     echo "Allan variance analysis finished."
     echo "Skipping camera and VIO calibration (mode=allan)."
-    publish_results
+    publish_results imu.yaml
     echo "Done!"
     exit 0
 fi
@@ -405,8 +455,8 @@ PATCH_BODY
 
     echo ""
     echo "Kalibr VIO calibration 완료!"
-    echo "결과 파일: camchain-...-results.yaml (T_cam_imu 포함)"
-    publish_results
+    echo "결과 파일: <bag>-camchain-imucam.yaml (T_cam_imu 포함), <bag>-results-imucam.txt"
+    publish_results imu.yaml "$camchain_file" --imucam
     rm -f "$ros1_vio"
     # workdir 루트에 복사된 april yaml 정리 (원본은 data/ 에 유지)
     [ "$april_abs" != "$workdir/$april_base" ] && rm -f "$workdir/$april_base"
@@ -713,7 +763,7 @@ if ls imu-*.yaml 1> /dev/null 2>&1; then
     echo "  imu-*.yaml"
 fi
 
-publish_results
+publish_results imu.yaml camchain.yaml --imucam
 echo ""
 echo "Ready for VINS-Fusion etc."
 echo ""

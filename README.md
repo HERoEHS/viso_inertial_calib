@@ -41,9 +41,19 @@ cd viso_inertial_calib
 > 캘리브레이션 데이터(`data/`, `best_so_far/`, `backup/`, `camchain*.yaml` 등)는 `.gitignore` 로 git 밖에 둔다 — 장비 사이에는 따로 옮긴다.
 >
 > **어디서 무엇을 돌리나 (EDIE)**
-> - `allan` 모드(IMU 정지 bag → `imu.yaml`)는 **로봇에서도** 돈다. Docker·rosbags 가 없어도 되고, allan_ros2 가 설치돼 있으면 실행 중 pip·colcon 을 하지 않는다.
-> - `kalibr`·`sweep`·`all` 모드는 Docker 와 `kalibr:ros1`(ROS1) 이미지가 필요하다. 기본은 **PC 에서 계산**한다 — 로봇에서 녹화한 VIO bag 을 PC 로 옮겨 실행한다. Docker 가 없는 장비에서는 안내를 띄우고 멈춘다(arm64 이미지 빌드는 검증 안 됨).
-> - 결과(`imu.yaml`, `camchain.yaml`, 최신 `camchain-imucam-*.yaml`·`results-imucam-*.txt`)는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본 `~/.edie/calib`)** 에도 복사된다. PC 에서 계산한 결과를 로봇에 넣을 때도 같은 자리를 쓴다.
+> - `allan` 모드(IMU 정지 bag → `imu.yaml`)는 **로봇에서도** 돈다. Docker·rosbags 가 없어도 된다.
+>   - ROS 환경을 source 하지 않은 셸이면 `$ROS_WS/install/setup.bash`(기본 `~/ros2_ws`)를 먼저 불러온다.
+>   - allan_ros2 가 이미 설치돼 있으면 빌드하지 않는다(`ALLAN_REBUILD=1` 이면 다시 빌드). analysis.py 의 파이썬 모듈이 없을 때만 pip 로 설치한다.
+>   - IMU 주기는 bag 에서 잰다(rosbags → rosbag2_py). 토픽이 없거나 못 재면 멈춘다 — `IMU_RATE=<Hz>` 로 직접 줄 수 있다.
+>   - 노드가 `ALLAN_TIMEOUT`(기본 1800 s) 안에 결과를 못 내면 멈춘다.
+> - `kalibr`·`sweep`·`all` 모드는 Docker 와 `kalibr:ros1`(ROS1) 이미지가 필요하다. 기본은 **PC 에서 계산**한다. Docker 가 없는 장비에서는 무엇을 옮길지 안내하고 멈춘다(arm64 이미지 빌드는 검증 안 됨).
+>   - kalibr·sweep: VIO bag 과 실행 폴더의 `imu.yaml`(로봇 allan 결과)·`camchain.yaml` 이 PC 실행 폴더에 있어야 한다.
+>   - all: 카메라 bag·VIO bag·IMU 정지 bag 이 필요하다(로봇에서는 allan 만 먼저 돌리고 나머지는 PC 로).
+> - 결과는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본 `~/.edie/calib`)** 에도 복사된다. 모드마다 이번 실행에서 만들거나 쓴 것만 복사한다.
+>   - allan: `imu.yaml`
+>   - kalibr: `imu.yaml`·`$CAMCHAIN_FILE`(기본 `camchain.yaml`)·이번 실행이 만든 `<bag>-camchain-imucam.yaml`·`<bag>-results-imucam.txt`·`<bag>-imu.yaml`
+>   - all: `imu.yaml`·`camchain.yaml`·위 Kalibr 결과
+>   - sweep: 복사하지 않음(탐색용)
 > - allan 파라미터는 실행할 때 `output/allan_params.yaml` 로 새로 만든다(저장소의 `external/allan_ros2/config/config.yaml` 은 건드리지 않는다).
 
 ### 2. Prepare Your Data
