@@ -48,7 +48,13 @@ if [ "$mode" != "allan" ] && [ ! -e "$vio_bag" ]; then
 fi
 
 workdir=$(pwd)
+# 스크립트가 있는 폴더 — external/(allan_ros2·kalibr) 는 실행 폴더가 아니라 여기 기준으로 찾는다
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROS_WS=${ROS_WS:-$HOME/ros2_ws}
+# 장비별 캘리브 결과를 모아 두는 자리(실행 폴더와 별개). 최종 위치는 Yocto 설정 위치 결정에 따라 이 변수로 바꾼다.
+calib_dir=${EDIE_CALIB_DIR:-$HOME/.edie/calib}
+# 시험·특수 환경용: docker 실행 파일 이름(기본 docker)
+DOCKER=${DOCKER:-docker}
 camchain_file=${CAMCHAIN_FILE:-camchain.yaml}  # 환경변수로 override 가능: CAMCHAIN_FILE=camchain_raw.yaml
 output_dir="$workdir/output"
 mkdir -p "$output_dir"
@@ -72,15 +78,35 @@ echo "VIO: $vio_bag"
 echo "Grid: $april"
 echo ""
 
-# check tools
-if ! command -v rosbags-convert &> /dev/null; then
-    echo "Error: rosbags-convert not found. Install with: pip install rosbags" >&2
-    exit 1
-fi
+# 결과를 장비별 캘리브 자리(calib_dir)에도 둔다 — PC 에서 계산한 결과를 로봇에 넣을 때도 같은 경로를 쓰게.
+publish_results() {
+    mkdir -p "$calib_dir"
+    local f latest
+    for f in imu.yaml camchain.yaml; do
+        [ -f "$workdir/$f" ] && cp -f "$workdir/$f" "$calib_dir/$f"
+    done
+    for pat in 'camchain-imucam-*.yaml' 'results-imucam-*.txt'; do
+        latest=$(ls -t "$workdir"/$pat 2>/dev/null | head -1 || true)
+        [ -n "$latest" ] && cp -f "$latest" "$calib_dir/"
+    done
+    echo "결과 복사: $calib_dir (EDIE_CALIB_DIR 로 바꿀 수 있음)"
+}
 
-if ! command -v docker &> /dev/null; then
-    echo "Error: docker not found." >&2
-    exit 1
+# check tools — Docker·rosbags-convert 는 Kalibr 단계에서만 쓴다. allan 모드는 둘 다 없어도 돈다(Docker 없는 로봇).
+if [ "$mode" != "allan" ]; then
+    if ! command -v "$DOCKER" &> /dev/null; then
+        echo "Error: Kalibr 계산에는 Docker 와 kalibr:ros1 이미지가 필요한데 이 장비($(uname -m))에 '$DOCKER' 가 없습니다." >&2
+        echo "  로봇이라면: 녹화한 VIO bag 을 PC 로 옮겨 PC 에서 같은 명령(MODE=$mode)을 실행하세요." >&2
+        echo "  결과(camchain-imucam-*.yaml 등)는 로봇의 \$EDIE_CALIB_DIR(기본 ~/.edie/calib)에 두면 됩니다." >&2
+        exit 1
+    fi
+    if ! command -v rosbags-convert &> /dev/null; then
+        echo "Error: rosbags-convert not found. Install with: pip install rosbags" >&2
+        exit 1
+    fi
+    if [ "$(uname -m)" = "aarch64" ] && ! "$DOCKER" image inspect kalibr:ros1 > /dev/null 2>&1; then
+        echo "Warning: aarch64 에서 kalibr:ros1 이미지를 새로 빌드합니다 — arm64 빌드는 검증되지 않았습니다(기본은 PC 계산)." >&2
+    fi
 fi
 
 # timeoffset-padding: Kalibr의 cam-IMU time shift 탐색 범위 + spline 버퍼 크기
@@ -100,34 +126,51 @@ else
 echo "Running allan variance using existing workspace: $ROS_WS"
 
 # params file for allan (공통 사용: ROS2 노드 + analysis.py)
-# 기존 예제 파일(external/allan_ros2/config/config.yaml)을 실행 시점에 덮어써서 사용
-allan_cfg="$workdir/external/allan_ros2/config/config.yaml"
+# 결과 폴더에 새로 만든다 — 저장소 안 config.yaml 을 덮어쓰면 git 이 더러워지고, 설치본(share)은 읽기 전용이다.
+allan_cfg="$output_dir/allan_params.yaml"
 
 # bag에서 실제 샘플레이트 자동 계산 (header.stamp 기준)
 echo "Detecting actual IMU sample rate from bag..."
 imu_rate=$(python3 - <<PYEOF
 import sys
-try:
-    import numpy as np
+def stamps_rosbags(path, topic):
     from rosbags.rosbag2 import Reader
     from rosbags.typesys import Stores, get_typestore
     typestore = get_typestore(Stores.ROS2_HUMBLE)
     ts = []
-    with Reader("$imu_bag") as r:
-        conns = [c for c in r.connections if c.topic == "$imu_topic"]
-        if not conns:
-            print(400, end='')
-            sys.exit(0)
+    with Reader(path) as r:
+        conns = [c for c in r.connections if c.topic == topic]
         for conn, t, raw in r.messages(connections=conns):
             msg = typestore.deserialize_cdr(raw, conn.msgtype)
             ts.append(msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec)
             if len(ts) > 5000:  # 5000샘플이면 충분
                 break
-    diffs = np.diff(ts[:5000])
-    rate = round(1e9 / np.mean(diffs))
-    print(rate, end='')
-except Exception as e:
-    print(400, end='')
+    return ts
+def stamps_rosbag2_py(path, topic):
+    # 로봇처럼 pip rosbags 가 없는 곳 — ROS2 에 들어 있는 rosbag2_py 로 읽는다
+    import rosbag2_py
+    from rclpy.serialization import deserialize_message
+    from sensor_msgs.msg import Imu
+    r = rosbag2_py.SequentialReader()
+    r.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"), rosbag2_py.ConverterOptions("", ""))
+    r.set_filter(rosbag2_py.StorageFilter(topics=[topic]))
+    ts = []
+    while r.has_next() and len(ts) <= 5000:
+        _, raw, _ = r.read_next()
+        m = deserialize_message(raw, Imu)
+        ts.append(m.header.stamp.sec * 1_000_000_000 + m.header.stamp.nanosec)
+    return ts
+import numpy as np
+for fn in (stamps_rosbags, stamps_rosbag2_py):
+    try:
+        ts = fn("$imu_bag", "$imu_topic")
+        if len(ts) >= 10:
+            print(round(1e9 / np.mean(np.diff(ts[:5000]))), end='')
+            sys.exit(0)
+    except Exception as e:
+        print(f"[rate] {fn.__name__} 실패: {e}", file=sys.stderr)
+print("[rate] WARN: bag 에서 주기를 못 재서 400 Hz 로 둡니다 — 결과 imu.yaml 이 틀릴 수 있습니다", file=sys.stderr)
+print(400, end='')
 PYEOF
 )
 echo "Detected IMU rate: ${imu_rate} Hz"
@@ -142,15 +185,22 @@ allan_node:
     sample_rate: $imu_rate
 EOF
 
-# build in existing ROS2 workspace (no allan_ws)
-pip3 install matplotlib numpy scipy pyyaml
-
-cd "$ROS_WS"
-allan_ros2_path="$ROS_WS/src/edie9/edie_localization/third_party/viso_inertial_calib/external/allan_ros2"
-rosdep install --from-paths $allan_ros2_path -y --ignore-src --skip-keys px4_msgs
-colcon build --packages-select allan_ros2
-
-source "$ROS_WS/install/setup.bash"
+# allan_ros2 준비 — 이미 설치돼 있으면(로봇·install-only 배포) 실행 중 pip·colcon 을 하지 않는다.
+[ -z "$(command -v ros2)" ] && [ -f "$ROS_WS/install/setup.bash" ] && source "$ROS_WS/install/setup.bash"
+if ! python3 -c "import matplotlib, numpy, scipy, yaml" 2>/dev/null; then
+    echo "analysis.py 의존 모듈 설치(matplotlib numpy scipy pyyaml)..."
+    pip3 install matplotlib numpy scipy pyyaml
+fi
+if ros2 pkg prefix allan_ros2 > /dev/null 2>&1; then
+    echo "allan_ros2: 설치본 사용 ($(ros2 pkg prefix allan_ros2))"
+else
+    # 소스 체크아웃에서만 가능한 경로 — 스크립트 옆의 external/allan_ros2 를 ROS_WS 에서 빌드한다
+    echo "allan_ros2 가 설치돼 있지 않아 $ROS_WS 에서 빌드합니다..."
+    allan_ros2_path="$script_dir/external/allan_ros2"
+    (cd "$ROS_WS" && rosdep install --from-paths "$allan_ros2_path" -y --ignore-src --skip-keys px4_msgs \
+        && colcon build --symlink-install --packages-select allan_ros2)
+    source "$ROS_WS/install/setup.bash"
+fi
 
 # run allan analysis from output_dir so deviation.csv, plots, imu.yaml 모두 그 안에 생성되도록
 cd "$output_dir"
@@ -183,7 +233,9 @@ echo "Generating IMU params..."
 if [ -f "$output_dir/deviation.csv" ]; then
     # output_dir 안에서 실행하여 imu.yaml, acceleration.png, gyro.png 모두 output_dir에 생성
     cd "$output_dir"
-    python3 "$workdir/external/allan_ros2/scripts/analysis.py" --data deviation.csv --config "$allan_cfg"
+    analysis_py="$(ros2 pkg prefix allan_ros2 2>/dev/null)/lib/allan_ros2/analysis.py"
+    [ -f "$analysis_py" ] || analysis_py="$script_dir/external/allan_ros2/scripts/analysis.py"
+    python3 "$analysis_py" --data deviation.csv --config "$allan_cfg"
 
     if [ -f "$output_dir/imu.yaml" ]; then
         echo "IMU calib generated."
@@ -204,6 +256,7 @@ echo ""
 if [ "$mode" = "allan" ]; then
     echo "Allan variance analysis finished."
     echo "Skipping camera and VIO calibration (mode=allan)."
+    publish_results
     echo "Done!"
     exit 0
 fi
@@ -241,9 +294,9 @@ if [ "$mode" = "kalibr" ]; then
     april="$april_base"
 
     # kalibr docker 이미지 빌드 (없는 경우)
-    if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
+    if ! "$DOCKER" image inspect kalibr:ros1 > /dev/null 2>&1; then
         echo "kalibr docker 이미지 빌드 중..."
-        docker build -t kalibr:ros1 "$workdir/external/kalibr" -f "$workdir/external/kalibr/Dockerfile_ros1_20_04"
+        "$DOCKER" build -t kalibr:ros1 "$script_dir/external/kalibr" -f "$script_dir/external/kalibr/Dockerfile_ros1_20_04"
         if [ $? -ne 0 ]; then
             echo "Docker build failed" >&2
             exit 1
@@ -338,7 +391,7 @@ PATCH_BODY
     echo "Measuring cam-IMU time offset for padding..."
     timeoffset_padding=$(compute_timeoffset_padding "$vio_bag" | awk '{print $1}')
     echo "timeoffset-padding: ${timeoffset_padding}s"
-    docker run --rm -v "$workdir":/data -w /data --entrypoint bash kalibr:ros1 \
+    "$DOCKER" run --rm -v "$workdir":/data -w /data --entrypoint bash kalibr:ros1 \
         -c "export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1 && \
             source /catkin_ws/devel/setup.bash && \
             python3 /data/kalibr_patch.py && \
@@ -353,6 +406,7 @@ PATCH_BODY
     echo ""
     echo "Kalibr VIO calibration 완료!"
     echo "결과 파일: camchain-...-results.yaml (T_cam_imu 포함)"
+    publish_results
     rm -f "$ros1_vio"
     # workdir 루트에 복사된 april yaml 정리 (원본은 data/ 에 유지)
     [ "$april_abs" != "$workdir/$april_base" ] && rm -f "$workdir/$april_base"
@@ -391,9 +445,9 @@ if [ "$mode" = "sweep" ]; then
     april="$april_base"
 
     # kalibr docker 이미지 빌드 (없는 경우)
-    if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
+    if ! "$DOCKER" image inspect kalibr:ros1 > /dev/null 2>&1; then
         echo "kalibr docker 이미지 빌드 중..."
-        docker build -t kalibr:ros1 "$workdir/external/kalibr" -f "$workdir/external/kalibr/Dockerfile_ros1_20_04"
+        "$DOCKER" build -t kalibr:ros1 "$script_dir/external/kalibr" -f "$script_dir/external/kalibr/Dockerfile_ros1_20_04"
         if [ $? -ne 0 ]; then
             echo "Docker build failed" >&2
             exit 1
@@ -524,7 +578,7 @@ with open(path, 'w') as f:
 PATCH_BODY
 
         set +e
-        docker run --rm \
+        "$DOCKER" run --rm \
             -v "$workdir":/data \
             -v "$OUTPUT_DIR":/output \
             -w /output \
@@ -597,9 +651,9 @@ echo ""
 # camera calib
 echo "Camera calibration..."
 
-if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
+if ! "$DOCKER" image inspect kalibr:ros1 > /dev/null 2>&1; then
     echo "Building kalibr docker..."
-    docker build -t kalibr:ros1 external/kalibr -f external/kalibr/Dockerfile_ros1_20_04
+    "$DOCKER" build -t kalibr:ros1 "$script_dir/external/kalibr" -f "$script_dir/external/kalibr/Dockerfile_ros1_20_04"
     
     if [ $? -ne 0 ]; then
         echo "Docker build failed" >&2
@@ -608,7 +662,7 @@ if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
 fi
 
 echo "Running cam calib..."
-docker run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
+"$DOCKER" run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
     "kalibr_calibrate_cameras --bag /data/$ros1_cam --target /data/$april --models pinhole-radtan --topics /camera/image_raw"
 
 if [ $? -ne 0 ]; then
@@ -635,7 +689,7 @@ echo "Measuring cam-IMU time offset for padding..."
 timeoffset_padding=$(compute_timeoffset_padding "$vio_bag" | awk '{print $1}')
 echo "timeoffset-padding: ${timeoffset_padding}s"
 
-docker run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
+"$DOCKER" run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
     "kalibr_calibrate_imu_camera --bag /data/$ros1_vio --target /data/$april --cam /data/$camchain_file --imu /data/imu.yaml --timeoffset-padding $timeoffset_padding"
 
 if [ $? -ne 0 ]; then
@@ -659,6 +713,7 @@ if ls imu-*.yaml 1> /dev/null 2>&1; then
     echo "  imu-*.yaml"
 fi
 
+publish_results
 echo ""
 echo "Ready for VINS-Fusion etc."
 echo ""

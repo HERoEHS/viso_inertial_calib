@@ -39,6 +39,12 @@ cd viso_inertial_calib
 > ```
 >
 > 캘리브레이션 데이터(`data/`, `best_so_far/`, `backup/`, `camchain*.yaml` 등)는 `.gitignore` 로 git 밖에 둔다 — 장비 사이에는 따로 옮긴다.
+>
+> **어디서 무엇을 돌리나 (EDIE)**
+> - `allan` 모드(IMU 정지 bag → `imu.yaml`)는 **로봇에서도** 돈다. Docker·rosbags 가 없어도 되고, allan_ros2 가 설치돼 있으면 실행 중 pip·colcon 을 하지 않는다.
+> - `kalibr`·`sweep`·`all` 모드는 Docker 와 `kalibr:ros1`(ROS1) 이미지가 필요하다. 기본은 **PC 에서 계산**한다 — 로봇에서 녹화한 VIO bag 을 PC 로 옮겨 실행한다. Docker 가 없는 장비에서는 안내를 띄우고 멈춘다(arm64 이미지 빌드는 검증 안 됨).
+> - 결과(`imu.yaml`, `camchain.yaml`, 최신 `camchain-imucam-*.yaml`·`results-imucam-*.txt`)는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본 `~/.edie/calib`)** 에도 복사된다. PC 에서 계산한 결과를 로봇에 넣을 때도 같은 자리를 쓴다.
+> - allan 파라미터는 실행할 때 `output/allan_params.yaml` 로 새로 만든다(저장소의 `external/allan_ros2/config/config.yaml` 은 건드리지 않는다).
 
 ### 2. Prepare Your Data
 
