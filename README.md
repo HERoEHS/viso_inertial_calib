@@ -57,6 +57,7 @@ cd viso_inertial_calib
 >   - 결과를 쓰는 쪽(VINS 설정 등)은 `<bag>-camchain-imucam.yaml`(내부 파라미터 + T_cam_imu 포함)을 기준으로 읽는다. `$CAMCHAIN_FILE` 은 자기 이름 그대로 복사되므로 예전 `camchain.yaml` 과 함께 있을 수 있다.
 >   - kalibr·all 에서 이번 실행이 만든 Kalibr 결과가 없으면 오류로 끝난다.
 > - allan 파라미터는 실행할 때 `output/allan_params.yaml` 로 새로 만든다(저장소의 `external/allan_ros2/config/config.yaml` 은 건드리지 않는다).
+> - `external/kalibr` 는 ROS1(catkin) 이라 `COLCON_IGNORE` 로 colcon 전체 빌드에서 빠진다(Docker 이미지 안에서만 catkin 으로 빌드). 같은 포크의 `.dockerignore` 가 이 표식을 이미지에 넣지 않는다 — catkin 도 COLCON_IGNORE 를 무시 표식으로 보기 때문(SW1-1951).
 
 ### 2. Prepare Your Data
 
