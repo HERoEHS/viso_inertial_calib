@@ -49,7 +49,7 @@ cd viso_inertial_calib
 > - `kalibr`·`sweep`·`all` 모드는 Docker 와 `kalibr:ros1`(ROS1) 이미지가 필요하다. 기본은 **PC 에서 계산**한다. Docker 가 없는 장비에서는 무엇을 옮길지 안내하고 멈춘다(arm64 이미지 빌드는 검증 안 됨).
 >   - kalibr·sweep: VIO bag 과 실행 폴더의 `imu.yaml`(로봇 allan 결과)·`camchain.yaml` 이 PC 실행 폴더에 있어야 한다.
 >   - all: IMU 정지 bag·카메라 bag·VIO bag 이 모두 필요하고 allan 을 다시 돈다. 로봇에서는 `MODE=allan` 으로 imu.yaml 만 만들고, PC 에서는 `MODE=kalibr` 로 이어 가면 된다.
-> - 결과는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본 `~/.edie/calib`)** 에도 복사된다. 모드마다 이번 실행에서 만들거나 쓴 것만 복사한다.
+> - 결과는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본: root·edieOS 면 `/var/lib/edie/data/calib`, 그 밖은 `~/.edie/calib` — 규칙 `lib/calib_dir.sh`, 시험은 `bash test/test_calib_dir.sh` 로 직접 돌린다 — colcon 패키지가 아니라 자동으로 돌지 않음)** 에도 복사된다. 모드마다 이번 실행에서 만들거나 쓴 것만 복사한다.
 >   - allan: `imu.yaml`
 >   - kalibr: `imu.yaml`·`$CAMCHAIN_FILE`(기본 `camchain.yaml`)·이번 실행이 만든 `<bag>-camchain-imucam.yaml`·`<bag>-results-imucam.txt`·`<bag>-imu.yaml`
 >   - all: `imu.yaml`·`camchain.yaml`·위 Kalibr 결과

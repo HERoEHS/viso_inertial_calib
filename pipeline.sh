@@ -51,8 +51,14 @@ workdir=$(pwd)
 # 스크립트가 있는 폴더 — external/(allan_ros2·kalibr) 는 실행 폴더가 아니라 여기 기준으로 찾는다
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROS_WS=${ROS_WS:-$HOME/ros2_ws}
-# 장비별 캘리브 결과를 모아 두는 자리(실행 폴더와 별개). 최종 위치는 Yocto 설정 위치 결정에 따라 이 변수로 바꾼다.
-calib_dir=${EDIE_CALIB_DIR:-$HOME/.edie/calib}
+# 장비별 캘리브 결과를 모아 두는 자리(실행 폴더와 별개) — 로봇이 "만드는" 파일이라 데이터 폴더 규칙을 따른다(SW1-1959):
+#   EDIE_CALIB_DIR 가 있으면 그대로(최우선). 없으면 root(edieOS)이고 /var/lib/edie 를 만들어 쓸 수 있을 때
+#   /var/lib/edie/data/calib, 그 밖(Ubuntu edie 계정)은 예전 그대로 $HOME/.edie/calib. 규칙은 lib/calib_dir.sh.
+#   설치본(/opt/edie/current/share)과는 다른 자리다 — 거기엔 로봇이 "읽는" 캘리브 yaml 만 둔다.
+# shellcheck source=lib/calib_dir.sh
+. "$script_dir/lib/calib_dir.sh"
+calib_dir=$(edie_resolve_calib_dir)
+export EDIE_CALIB_DIR="$calib_dir"   # 자식 프로세스가 같은 값을 보게(지금 이 변수를 읽는 자식은 없음 — allan 설정은 259줄쯤에서 bag_path 를 직접 적는다)
 # 시험·특수 환경용: docker 실행 파일 이름(기본 docker)
 DOCKER=${DOCKER:-docker}
 camchain_file=${CAMCHAIN_FILE:-camchain.yaml}  # 환경변수로 override 가능: CAMCHAIN_FILE=camchain_raw.yaml
@@ -121,7 +127,7 @@ if [ "$mode" != "allan" ]; then
         else
             echo "  로봇이라면: VIO bag 과 imu.yaml·$camchain_file 을 PC 실행 폴더로 옮겨 PC 에서 같은 명령(MODE=$mode)을 실행하세요." >&2
         fi
-        echo "  결과(<bag>-camchain-imucam.yaml·<bag>-results-imucam.txt)는 로봇의 \$EDIE_CALIB_DIR(기본 ~/.edie/calib)에 두면 됩니다." >&2
+        echo "  결과(<bag>-camchain-imucam.yaml·<bag>-results-imucam.txt)는 로봇의 \$EDIE_CALIB_DIR(기본: edieOS /var/lib/edie/data/calib, Ubuntu ~/.edie/calib)에 두면 됩니다." >&2
         exit 1
     fi
     if ! command -v rosbags-convert &> /dev/null; then

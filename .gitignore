@@ -10,3 +10,4 @@ data/
 backup/
 best_so_far/
 output/
+.env.local
