@@ -4,10 +4,16 @@ set -e
 if [ "$#" -lt 4 ] || [ "$#" -gt 7 ]; then
   echo "Usage: $0 BAG_IMU BAG_CAM BAG_VIO APRILGRID_YAML [MODE] [IMU_TOPIC] [TIMESHIFT_MS|auto]" >&2
   echo "  MODE: all (default) | allan | kalibr | sweep" >&2
-  echo "  IMU_TOPIC: IMU 토픽 (기본값: /edie/sensor/offset_imu)" >&2
-  echo "  TIMESHIFT_MS: timeshift prior (ms 단위). 생략 시 bag에서 자동 추정" >&2
+  echo "  IMU_TOPIC: IMU 토픽 (기본값: /edie/sensor/offset_imu, allan 용 — Kalibr 는 imu.yaml 의 rostopic 을 쓴다)" >&2
+  echo "  TIMESHIFT_MS: 카메라→IMU 시간차 시작값(ms). auto(기본) = Kalibr 자체 추정(각속도 크기 교차상관)" >&2
+  echo "          롤링셔터 카메라는 화면 가운데 줄 기준이라 약 +읽기시간/2 가 더해진다(.224: 약 35 ms)." >&2
+  echo "          롤링셔터면 auto 가 크게 빗나가 멈출 수 있다(.224 실측 −18.5 ms → 종료 코드 6) — 숫자로 주자" >&2
   echo "  kalibr: allan 스킵, 기존 imu.yaml+camchain.yaml 사용, VIO 캘립만 실행" >&2
-  echo "          BAG_IMU, BAG_CAM 은 '-' 로 생략 가능" >&2
+  echo "          BAG_IMU, BAG_CAM 은 '-' 로 생략 가능. BAG_VIO 가 ROS1 .bag 파일이면 변환 없이 그대로 쓴다" >&2
+  echo "          본계산 전 모서리 배치 자동 점검(멈추면 종료 코드 3), 최적화 전 재투영 관문(종료 코드 4)," >&2
+  echo "          끝난 뒤 결과 요약 kalibr_quality.txt(FAIL 이면 게시 안 함, 종료 코드 5)" >&2
+  echo "  환경변수(kalibr·sweep): KALIBR_TAG_BORDER=1|2(테두리 질문 생략), KALIBR_CORNER_LAYOUT=auto|identity|rot180|...," >&2
+  echo "          KALIBR_CHECK_ONLY=1(배치 점검만), KALIBR_CHECK_FRAMES=20, KALIBR_GATE_PX=5, KALIBR_REF_CAMCHAIN=<기준 yaml>" >&2
   echo "  sweep:  tagSize 21~27mm 범위를 1mm 간격으로 Kalibr 반복 실행, reprojection error 최솟값 탐색" >&2
   echo "          kalibr 모드 전제 (imu.yaml + camchain.yaml 필요), BAG_IMU, BAG_CAM 은 '-' 로 생략 가능" >&2
   echo "Example: $0 imu_stationary.bag camera_intrinsics.bag vio_calibration.bag aprilgrid.yaml allan" >&2
@@ -45,6 +51,11 @@ fi
 if [ "$mode" != "allan" ] && [ ! -e "$vio_bag" ]; then
     echo "Error: VIO bag path '$vio_bag' not found" >&2
     exit 1
+fi
+# VIO bag 이 이미 ROS1 .bag 파일이면(예: 전에 변환해 둔 것) kalibr·sweep 은 다시 변환하지 않는다 — 2 GB 넘는 파일을 또 만들지 않게.
+vio_is_ros1=0
+if [ "$mode" != "allan" ] && [ -f "$vio_bag" ] && [[ "$vio_bag" == *.bag ]]; then
+    vio_is_ros1=1
 fi
 
 workdir=$(pwd)
@@ -130,7 +141,7 @@ if [ "$mode" != "allan" ]; then
         echo "  결과(<bag>-camchain-imucam.yaml·<bag>-results-imucam.txt)는 로봇의 \$EDIE_CALIB_DIR(기본: edieOS /var/lib/edie/data/calib, Ubuntu ~/.edie/calib)에 두면 됩니다." >&2
         exit 1
     fi
-    if ! command -v rosbags-convert &> /dev/null; then
+    if { [ "$mode" = "all" ] || [ "$vio_is_ros1" = "0" ]; } && ! command -v rosbags-convert &> /dev/null; then
         echo "Error: rosbags-convert not found. Install with: pip install rosbags" >&2
         exit 1
     fi
@@ -141,10 +152,179 @@ fi
 
 # timeoffset-padding: Kalibr의 cam-IMU time shift 탐색 범위 + spline 버퍼 크기
 # padding은 spline 버퍼에도 영향 (buffer = [t_shifted_start - 2*padding, t_shifted_end + 2*padding]).
-# pre-estimate가 50ms면 padding은 반드시 ≥ 50ms여야 버퍼 오버플로우를 막을 수 있음.
-# 대신 timeshiftCamToImuPrior는 코드 패치로 직접 9ms로 오버라이드함.
+# 최적화 중 시간차는 시작값에서 ±padding 안에서만 움직인다 → 시작값이 실제와 50 ms 넘게 틀리면 못 따라간다.
+# (옛 판은 시작값을 9 ms 등으로 덮어썼다. 그때 Kalibr 추정 50 ms 를 의심한 것은 모서리 배치가 틀린 35 px 상태였다 —
+#  2026-11-12 조사. 이제 TIMESHIFT_MS=auto 면 Kalibr 자체 추정을 그대로 쓴다.)
 compute_timeoffset_padding() {
-    echo "0.05 (fixed: spline buffer requires >=50ms; timeshift overridden separately)"
+    echo "0.05 (fixed: spline buffer requires >=50ms)"
+}
+
+# ── Kalibr imu-cam 공통 준비(kalibr·sweep 모드) ─────────────────────────────────────────
+# 왜(2026-11-12 .224 사고): 보드 그림 방향이 Kalibr 기대와 다르면 검출기가 태그마다 모서리 번호를 엇갈려 붙여
+# 재투영 49 px 로 발산하는데도 Kalibr 는 결과를 다 쓰고 "완료" 했다. 어긋나는 방식은 녹화마다 달랐다(180°·좌우).
+# 그래서 ① 본계산 전 8가지 배치 점검·선택 ② 최적화 전 재투영 관문 ③ 끝난 뒤 결과 요약·FAIL 이면 게시 안 함.
+# 종료 코드 약속: 3 = 배치 점검에서 멈춤(본계산 안 함), 4 = 최적화 전 관문에서 멈춤, 5 = 결과 요약 FAIL(게시 안 함),
+#                 6 = 시간차 시작값이 너무 틀려 최적화가 탐색 범위를 벗어남(결과 없음)
+KALIBR_GATE_PX=${KALIBR_GATE_PX:-5}                # 최적화 전 재투영 평균 문턱 px(임시값)
+KALIBR_CHECK_FRAMES=${KALIBR_CHECK_FRAMES:-20}     # 배치 점검에 쓸 프레임 수
+KALIBR_CORNER_LAYOUT=${KALIBR_CORNER_LAYOUT:-auto} # auto = 점검해서 고름, 그 밖 = 그 배치를 모든 카메라에 강제(점검 안 함)
+KALIBR_LAYOUT_NAMES="identity rot90 rot180 rot270 flip_lr flip_ud transpose antitranspose"   # lib/kalibr_layout.py 와 같게
+ros1_vio="$workdir/vio_ros1.bag"
+ros1_cleanup=0      # 1 이면 이 실행이 만든 ROS1 bag(변환본·하드링크) → 성공 뒤 지운다
+ros1_mount=()       # 하드링크를 못 만들 때 원본 파일을 Docker 의 /data/vio_ros1.bag 로 바로 연결
+
+# VIO bag 을 실행 폴더의 vio_ros1.bag 로 준비한다(ROS2 면 변환, ROS1 .bag 이면 하드링크 — 복사하지 않는다)
+prepare_ros1_vio() {
+    if [ "$vio_is_ros1" = "1" ]; then
+        if [ "$(realpath "$vio_bag")" = "$(realpath -m "$ros1_vio")" ]; then
+            echo "ROS1 bag: 실행 폴더의 vio_ros1.bag 그대로 사용(지우지 않음)"
+        elif ln -f "$vio_bag" "$ros1_vio" 2>/dev/null; then
+            ros1_cleanup=1
+            echo "ROS1 bag: $vio_bag → 하드링크 $ros1_vio (복사 아님, 끝나면 링크만 지움)"
+        else
+            ros1_mount=(-v "$vio_bag":/data/vio_ros1.bag:ro)
+            echo "ROS1 bag: 다른 디스크라 하드링크 불가 → Docker 에 파일째 연결"
+        fi
+    else
+        rm -f "$ros1_vio"
+        echo "ROS2 bag → ROS1 변환 중..."
+        rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
+        ros1_cleanup=1
+        echo "변환 완료."
+    fi
+}
+
+# 실패로 끝날 때도 하드링크·Docker 가 만든 빈 연결 자리는 치운다(변환본은 다시 돌릴 수 있게 남긴다 — 예전과 같음)
+cleanup_ros1_links() {
+    if [ "$vio_is_ros1" = "1" ] && [ "$ros1_cleanup" = "1" ]; then rm -f "$ros1_vio"; fi
+    if [ "${#ros1_mount[@]}" -gt 0 ] && [ -f "$ros1_vio" ] && [ ! -s "$ros1_vio" ]; then rm -f "$ros1_vio" 2>/dev/null || true; fi
+}
+
+# 보드 테두리: 표준 AprilTag36h11(1칸) → 1, Kalibr 로 만든 보드(2칸) → 2. KALIBR_TAG_BORDER 가 있으면 묻지 않는다.
+choose_tag_border() {
+    case "${KALIBR_TAG_BORDER:-}" in
+        1|2)
+            _tag_border=$KALIBR_TAG_BORDER
+            echo "보드 테두리: KALIBR_TAG_BORDER=$_tag_border (질문 생략)"
+            ;;
+        "")
+            read -r -p "타깃이 표준 AprilTag36h11 (1-cell black border) 입니까? [Y/n]: " _tag_reply || _tag_reply=""
+            _tag_reply="${_tag_reply:-Y}"
+            if [[ "$_tag_reply" =~ ^[Yy]$ ]]; then
+                _tag_border=1
+                echo "  → blackTagBorder=1 패치 적용"
+            else
+                _tag_border=2
+                echo "  → blackTagBorder Kalibr 기본값 사용 (2-cell)"
+            fi
+            ;;
+        *)
+            echo "Error: KALIBR_TAG_BORDER 는 1(표준 AprilTag) 또는 2(Kalibr 보드)만 됩니다: '$KALIBR_TAG_BORDER'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# 시간차 시작값: auto = Kalibr 자체 추정(덮어쓰지 않음), 숫자 = 그 ms 로 덮어씀
+choose_timeshift() {
+    if [ "$timeshift_arg" = "auto" ]; then
+        _ts_patch=auto
+        echo "시간차 시작값: Kalibr 자체 추정(카메라·자이로 각속도 크기 교차상관). 숫자로 직접 줄 수도 있음(7번째 인자, ms)"
+    elif [[ "$timeshift_arg" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        _ts_patch=$timeshift_arg
+        echo "시간차 시작값: ${timeshift_arg} ms (직접 지정)"
+    else
+        echo "Error: TIMESHIFT_MS 는 auto 또는 ms 숫자여야 합니다: '$timeshift_arg'" >&2
+        exit 1
+    fi
+}
+
+# 모서리 배치 점검(Docker, 1코어 낮은 우선순위 — 단일 스레드 계산이라 느려지지 않는다). 결과로 layout_args 를 채운다.
+#   인자: $1 = 강제 무시하고 점검만 할지(1)
+layout_args=()
+run_layout_check() {
+    local force_check=${1:-0} rc name ok topic lay
+    layout_args=()
+    if [ "$KALIBR_CORNER_LAYOUT" != "auto" ] && [ "$force_check" != "1" ]; then
+        ok=0
+        for name in $KALIBR_LAYOUT_NAMES; do [ "$name" = "$KALIBR_CORNER_LAYOUT" ] && ok=1; done
+        if [ "$ok" != "1" ]; then
+            echo "Error: KALIBR_CORNER_LAYOUT 는 auto 또는 다음 중 하나: $KALIBR_LAYOUT_NAMES (지금 '$KALIBR_CORNER_LAYOUT')" >&2
+            exit 1
+        fi
+        echo "모서리 배치: KALIBR_CORNER_LAYOUT=$KALIBR_CORNER_LAYOUT 를 모든 카메라에 강제(점검 생략)"
+        layout_args=(--layout "*=$KALIBR_CORNER_LAYOUT")
+        return 0
+    fi
+    echo "모서리 배치 자동 점검(프레임 ${KALIBR_CHECK_FRAMES}장, 배치 8가지)..."
+    rm -f "$output_dir/kalibr_layout_choice.txt" "$output_dir/kalibr_layout_check.txt" "$output_dir/kalibr_layout_check.json"
+    set +e
+    "$DOCKER" run --rm --cpus=1 -v "$workdir":/data -v "$script_dir/lib":/viso_lib:ro "${ros1_mount[@]}" -w /data \
+        -e LANG=C.UTF-8 -e MPLBACKEND=Agg -e OMP_NUM_THREADS=1 -e PYTHONDONTWRITEBYTECODE=1 \
+        --entrypoint bash kalibr:ros1 \
+        -c "source /catkin_ws/devel/setup.bash && nice -n 19 python3 /viso_lib/kalibr_layout_check.py \
+              --bag /data/vio_ros1.bag --cam /data/$camchain_file --target /data/$april \
+              --border $_tag_border --frames $KALIBR_CHECK_FRAMES \
+              --out-json /data/output/kalibr_layout_check.json --out-table /data/output/kalibr_layout_check.txt \
+              --out-choice /data/output/kalibr_layout_choice.txt" 2>&1 | tee "$output_dir/kalibr_layout_check.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" = "3" ]; then
+        echo "" >&2
+        echo "멈춤: 모서리 배치를 고르지 못했습니다(8가지 모두 맞지 않거나 1·2등 차이가 작음) — Kalibr 본계산을 시작하지 않습니다." >&2
+        echo "  확인할 것: 보드 설정 $april 의 tagSize(검은 사각형 한 변, m)·tagSpacing(간격÷태그 크기)·tagRows/tagCols(번호 배치)," >&2
+        echo "             테두리 답(KALIBR_TAG_BORDER=$_tag_border: 표준 AprilTag 1칸 / Kalibr 보드 2칸)," >&2
+        echo "             카메라 값 $camchain_file(내부값·왜곡·토픽·해상도가 이 녹화 카메라와 같은지)." >&2
+        echo "  표: $output_dir/kalibr_layout_check.txt" >&2
+        cleanup_ros1_links
+        exit 3
+    elif [ "$rc" != "0" ] || [ ! -s "$output_dir/kalibr_layout_choice.txt" ]; then
+        echo "Error: 모서리 배치 점검 실행 실패(종료 코드 $rc). 로그: $output_dir/kalibr_layout_check.log" >&2
+        cleanup_ros1_links
+        exit 1
+    fi
+    while read -r topic lay; do
+        [ -n "$topic" ] && layout_args+=(--layout "$topic=$lay")
+    done < "$output_dir/kalibr_layout_choice.txt"
+    echo "채택한 모서리 배치: ${layout_args[*]}"
+}
+
+# Kalibr imu-cam 본계산 한 번. 인자: $1 = 보드 yaml(실행 폴더 안 이름), $2 = 로그 파일. 결과: kalibr_rc
+#   --dont-show-report + MPLBACKEND=Agg: 화면(X) 없는 Docker 에서 보고서 창을 못 띄워 exit 1 나던 것을 없앤다(결과 파일은 원래 다 써졌음).
+run_kalibr_imucam() {
+    local target=$1 log=$2 patch_cmd a
+    patch_cmd="python3 /viso_lib/kalibr_patch.py --border $_tag_border --timeshift-ms $_ts_patch --gate-px $KALIBR_GATE_PX"
+    for a in "${layout_args[@]}"; do patch_cmd+=" $(printf '%q' "$a")"; done
+    set +e
+    "$DOCKER" run --rm -v "$workdir":/data -v "$script_dir/lib":/viso_lib:ro "${ros1_mount[@]}" -w /data \
+        -e LANG=C.UTF-8 -e MPLBACKEND=Agg -e PYTHONDONTWRITEBYTECODE=1 -e KALIBR_MANUAL_FOCAL_LENGTH_INIT=1 \
+        --entrypoint bash kalibr:ros1 \
+        -c "source /catkin_ws/devel/setup.bash && $patch_cmd && \
+            /catkin_ws/devel/lib/kalibr/kalibr_calibrate_imu_camera --bag /data/vio_ros1.bag --target /data/$target \
+              --cam /data/$camchain_file --imu /data/imu.yaml --timeoffset-padding $timeoffset_padding --dont-show-report" \
+        2>&1 | tee "$log"
+    kalibr_rc=${PIPESTATUS[0]}
+    set -e
+}
+
+# 최적화 첫 걸음에서 시간차가 탐색 범위(시작값 ±padding)를 벗어나면 Kalibr 가 "Spline Coefficient Buffer Exceeded" 로 죽는다.
+# 2026-11-12 .224(롤링셔터): Kalibr 자체 추정 −18.5 ms, 바른 값 약 +35 ms → 53 ms 차이로 ±50 ms 밖 → 이렇게 멈췄다.
+timeshift_stop_message() {
+    local priors
+    priors=$(grep -a -A1 "Time shift camera to imu" "$1" | grep -a -E '^-?[0-9.]+(e-?[0-9]+)?$' \
+             | awk '{printf "%.1f ms ", $1*1000}')
+    echo "" >&2
+    echo "멈춤: 시간차 시작값(${priors:-?})이 실제와 ${timeoffset_padding:-0.05} s 넘게 달라 Kalibr 최적화가 탐색 범위를 벗어났습니다" >&2
+    echo "      (Spline Coefficient Buffer Exceeded). 결과 파일은 없습니다." >&2
+    echo "  롤링셔터 카메라는 Kalibr 자체 추정(auto)이 크게 빗나갈 수 있습니다(.224 실측: 추정 −18.5 ms, 바른 값 약 +35 ms)." >&2
+    echo "  7번째 인자로 시작값(ms)을 직접 주세요: 대략 노출 지연 + 읽기시간/2 (.224: 3.2 + 64.4/2 ≈ 35)." >&2
+}
+
+gate_stop_message() {
+    echo "" >&2
+    echo "멈춤: 최적화 전 재투영 평균이 ${KALIBR_GATE_PX} px 를 넘었습니다(위 [VISO GATE] 줄) — 최적화해도 고쳐지지 않는 출발점입니다." >&2
+    echo "  확인할 것: 모서리 배치(KALIBR_CORNER_LAYOUT 을 강제했다면 auto 로), 보드 설정(tagSize·tagSpacing·번호 배치·테두리)," >&2
+    echo "             camchain(내부값·토픽·좌우 기준선 T_cn_cnm1), 시간차 시작값(7번째 인자), imu.yaml 의 rostopic." >&2
 }
 
 # kalibr 모드는 allan 전체 스킵
@@ -376,111 +556,76 @@ if [ "$mode" = "kalibr" ]; then
         fi
     fi
 
-    # ROS2 bag → ROS1 bag 변환
-    ros1_vio="$workdir/vio_ros1.bag"
-    rm -f "$ros1_vio"
-    echo "ROS2 bag → ROS1 변환 중..."
-    rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
-    echo "변환 완료."
+    # VIO bag → 실행 폴더의 vio_ros1.bag (ROS2 면 변환, ROS1 .bag 이면 하드링크)
+    prepare_ros1_vio
+    trap cleanup_ros1_links EXIT
+    rm -f "$workdir/kalibr_quality.txt"   # 지난 실행의 요약을 이번 것으로 착각하지 않게
 
-    # ── AprilTag 규격 확인 ────────────────────────────────────────────────
-    read -r -p "타깃이 표준 AprilTag36h11 (1-cell black border) 입니까? [Y/n]: " _tag_reply
-    _tag_reply="${_tag_reply:-Y}"
-    _apply_border=0
-    if [[ "$_tag_reply" =~ ^[Yy]$ ]]; then
-        _apply_border=1
-        echo "  → blackTagBorder=1 패치 적용"
-    else
-        echo "  → blackTagBorder Kalibr 기본값 사용 (2-cell)"
+    # ── 입력 정하기: 보드 테두리 · 모서리 배치 · 시간차 시작값 ─────────────────────
+    choose_tag_border
+    if [ "${KALIBR_CHECK_ONLY:-0}" = "1" ]; then
+        run_layout_check 1        # 배치 점검만 하고 끝(멈추면 여기서 exit 3)
+        echo "배치 점검만 실행(KALIBR_CHECK_ONLY=1) — 표: $output_dir/kalibr_layout_check.txt"
+        exit 0
     fi
-
-    # ── timeshift prior 결정 ─────────────────────────────────────────────
-    if [ "$timeshift_arg" != "auto" ]; then
-        _timeshift_s=$(python3 -c "print(f'{float(\"$timeshift_arg\")/1000:.6f}')")
-        echo "timeshift prior: ${timeshift_arg}ms (직접 지정)"
-    else
-        echo "bag 타임스탬프 분석으로 timeshift 자동 추정 중..."
-        _timeshift_s=$(python3 - "$vio_bag" "$imu_topic" << 'PYEOF'
-import sys, numpy as np
-from rosbags.rosbag2 import Reader
-from rosbags.typesys import Stores, get_typestore
-bag_path, imu_topic = sys.argv[1], sys.argv[2]
-typestore = get_typestore(Stores.ROS2_HUMBLE)
-cam_ts, imu_ts, cam_topic = [], [], None
-with Reader(bag_path) as r:
-    for c in r.connections:
-        if 'image' in c.topic and cam_topic is None:
-            cam_topic = c.topic
-    if cam_topic is None:
-        print("0.009"); sys.exit(0)
-    for conn, t, raw in r.messages():
-        if conn.topic == cam_topic and len(cam_ts) < 300:
-            msg = typestore.deserialize_cdr(raw, conn.msgtype)
-            cam_ts.append(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec)
-        elif conn.topic == imu_topic and len(imu_ts) < 10000:
-            msg = typestore.deserialize_cdr(raw, conn.msgtype)
-            imu_ts.append(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec)
-if len(cam_ts) < 10 or len(imu_ts) < 10:
-    print("0.009"); sys.exit(0)
-cam_ts = np.array(sorted(cam_ts))
-imu_ts = np.array(sorted(imu_ts))
-# shift = t_imu - t_cam (nearest IMU stamp after each camera stamp)
-diffs = [(imu_ts[np.searchsorted(imu_ts, ct)] - ct) / 1e9
-         for ct in cam_ts if np.searchsorted(imu_ts, ct) < len(imu_ts)]
-est = float(np.median(diffs)) if diffs else 0.009
-print(f"{max(-0.1, min(0.1, est)):.6f}")
-PYEOF
-        )
-        echo "  → 추정된 timeshift prior: $(python3 -c "print(f'{float(\"$_timeshift_s\")*1000:.2f}ms')")"
-    fi
-
-    # ── Kalibr 패치 파일 생성 (Docker 내에서 실행될 Python 스크립트) ──
-    # 첫 번째 heredoc: shell 변수 _apply_border, _timeshift_s 주입
-    cat > "$workdir/kalibr_patch.py" << PATCH_HEAD
-ts = ${_timeshift_s}
-apply_border = ${_apply_border}
-PATCH_HEAD
-    # 두 번째 heredoc: 따옴표 탈출 없이 Python 코드 그대로 (single-quoted delimiter)
-    cat >> "$workdir/kalibr_patch.py" << 'PATCH_BODY'
-path = '/catkin_ws/src/kalibr/aslam_offline_calibration/kalibr/python/kalibr_imu_camera_calibration/IccSensors.py'
-with open(path) as f:
-    code = f.read()
-if apply_border:
-    code = code.replace(
-        'options.showExtractionVideo = showExtraction\n            options.minTagsForValidObs',
-        'options.showExtractionVideo = showExtraction\n            options.blackTagBorder = 1\n            options.minTagsForValidObs')
-    print('patched blackTagBorder=1')
-code = code.replace(
-    '        self.timeshiftCamToImuPrior = shift\n        \n',
-    '        self.timeshiftCamToImuPrior = shift\n        self.timeshiftCamToImuPrior = ' + str(ts) +
-    '\n        print("[PATCH] Timeshift prior: ' + str(round(ts * 1000, 2)) + 'ms")\n        \n')
-print(f'patched timeshiftCamToImuPrior={ts:.6f}s ({ts*1000:.2f}ms)')
-with open(path, 'w') as f:
-    f.write(code)
-PATCH_BODY
+    run_layout_check
+    choose_timeshift
 
     # kalibr IMU-camera 캘리브레이션
     echo "IMU-camera 캘리브레이션 실행 중..."
-    echo "Measuring cam-IMU time offset for padding..."
     timeoffset_padding=$(compute_timeoffset_padding "$vio_bag" | awk '{print $1}')
     echo "timeoffset-padding: ${timeoffset_padding}s"
-    "$DOCKER" run --rm -v "$workdir":/data -w /data --entrypoint bash kalibr:ros1 \
-        -c "export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1 && \
-            source /catkin_ws/devel/setup.bash && \
-            python3 /data/kalibr_patch.py && \
-            /catkin_ws/devel/lib/kalibr/kalibr_calibrate_imu_camera --bag /data/vio_ros1.bag --target /data/$april --cam /data/$camchain_file --imu /data/imu.yaml --timeoffset-padding $timeoffset_padding"
-    rm -f "$workdir/kalibr_patch.py"
+    kalibr_log="$output_dir/kalibr_imucam.log"
+    results_txt="$workdir/vio_ros1-results-imucam.txt"
+    run_kalibr_imucam "$april" "$kalibr_log"
 
-    if [ $? -ne 0 ]; then
-        echo "VIO calib failed" >&2
+    # ── 성공 판단: 종료 코드가 아니라 "이번 실행의 결과 파일 + 결과 요약"으로 ─────────
+    results_new=0
+    [ -f "$results_txt" ] && [ "$results_txt" -nt "$run_marker" ] && results_new=1
+    if [ "$kalibr_rc" = "4" ]; then
+        gate_stop_message
+        echo "  로그: $kalibr_log" >&2
+        exit 4
+    elif [ "$kalibr_rc" != "0" ]; then
+        if [ "$results_new" = "1" ]; then
+            echo "Warning: Kalibr 종료 코드 $kalibr_rc 이지만 이번 실행의 결과 파일은 써졌습니다(보고서 단계 문제 등) — 결과 요약으로 판단합니다." >&2
+        elif grep -a -q "Spline Coefficient Buffer Exceeded" "$kalibr_log"; then
+            timeshift_stop_message "$kalibr_log"
+            exit 6
+        else
+            echo "Error: Kalibr 실패(종료 코드 $kalibr_rc), 이번 실행의 결과 파일 없음. 로그: $kalibr_log" >&2
+            exit 1
+        fi
+    elif [ "$results_new" != "1" ]; then
+        echo "Error: Kalibr 는 정상 종료했지만 결과 파일 $results_txt 가 이번 실행에서 써지지 않았습니다. 로그: $kalibr_log" >&2
         exit 1
     fi
 
+    # 결과 요약(PASS/WARN/FAIL) — 기준값: KALIBR_REF_CAMCHAIN, 없으면 입력 camchain 에 T_cam_imu 가 있을 때 그것
+    ref_args=()
+    if [ -n "${KALIBR_REF_CAMCHAIN:-}" ]; then
+        ref_args=(--ref "$KALIBR_REF_CAMCHAIN")
+    elif grep -q "T_cam_imu" "$workdir/$camchain_file"; then
+        ref_args=(--ref "$workdir/$camchain_file")
+    fi
     echo ""
-    echo "Kalibr VIO calibration 완료!"
-    echo "결과 파일: <bag>-camchain-imucam.yaml (T_cam_imu 포함), <bag>-results-imucam.txt"
-    publish_results imu.yaml "$camchain_file" --imucam
-    rm -f "$ros1_vio"
+    set +e
+    python3 "$script_dir/lib/kalibr_quality.py" "$results_txt" "${ref_args[@]}" --out "$workdir/kalibr_quality.txt"
+    quality_rc=$?
+    set -e
+    if [ "$quality_rc" != "0" ] && [ "$quality_rc" != "1" ]; then
+        echo "" >&2
+        echo "결과 요약 FAIL(또는 결과 파일을 못 읽음, 코드 $quality_rc) — 장비 보정 자리($calib_dir)로 게시하지 않습니다." >&2
+        echo "  요약: $workdir/kalibr_quality.txt, 로그: $kalibr_log" >&2
+        exit 5
+    fi
+
+    echo ""
+    echo "Kalibr VIO calibration 완료! (결과 요약: $( [ "$quality_rc" = "0" ] && echo PASS || echo WARN ))"
+    echo "결과 파일: <bag>-camchain-imucam.yaml (T_cam_imu 포함), <bag>-results-imucam.txt, kalibr_quality.txt"
+    publish_results imu.yaml "$camchain_file" kalibr_quality.txt --imucam
+    # 이 실행이 만든 ROS1 bag(변환본·하드링크)만 지운다 — 사용자가 준 원본은 그대로
+    if [ "$ros1_cleanup" = "1" ]; then rm -f "$ros1_vio"; fi
     # workdir 루트에 복사된 april yaml 정리 (원본은 data/ 에 유지)
     [ "$april_abs" != "$workdir/$april_base" ] && rm -f "$workdir/$april_base"
     echo "Done!"
@@ -527,65 +672,18 @@ if [ "$mode" = "sweep" ]; then
         fi
     fi
 
-    # ROS2 bag → ROS1 변환
-    ros1_vio="$workdir/vio_ros1.bag"
-    rm -f "$ros1_vio"
-    echo "ROS2 bag → ROS1 변환 중..."
-    rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
-    echo "변환 완료."
+    # VIO bag → 실행 폴더의 vio_ros1.bag (ROS2 면 변환, ROS1 .bag 이면 하드링크)
+    prepare_ros1_vio
+    trap cleanup_ros1_links EXIT
 
-    # AprilTag 규격 확인
-    read -r -p "타깃이 표준 AprilTag36h11 (1-cell black border) 입니까? [Y/n]: " _tag_reply
-    _tag_reply="${_tag_reply:-Y}"
-    _apply_border=0
-    if [[ "$_tag_reply" =~ ^[Yy]$ ]]; then
-        _apply_border=1
-        echo "  → blackTagBorder=1 패치 적용"
-    else
-        echo "  → blackTagBorder Kalibr 기본값 사용 (2-cell)"
-    fi
+    # 보드 테두리 · 모서리 배치 · 시간차 시작값 — kalibr 모드와 같다.
+    # 배치 점검은 한 번만: tagSize 만 바꾸면 보드 전체가 같은 비율로 커질 뿐이라 PnP 재투영은 그대로다.
+    choose_tag_border
+    run_layout_check
+    choose_timeshift
 
     # timeoffset-padding
     timeoffset_padding=$(compute_timeoffset_padding "$vio_bag" | awk '{print $1}')
-
-    # timeshift prior 결정
-    if [ "$timeshift_arg" != "auto" ]; then
-        _timeshift_s=$(python3 -c "print(f'{float(\"$timeshift_arg\")/1000:.6f}')")
-        echo "timeshift prior: ${timeshift_arg}ms (직접 지정)"
-    else
-        echo "bag 타임스탬프 분석으로 timeshift 자동 추정 중..."
-        _timeshift_s=$(python3 - "$vio_bag" "$imu_topic" << 'PYEOF'
-import sys, numpy as np
-from rosbags.rosbag2 import Reader
-from rosbags.typesys import Stores, get_typestore
-bag_path, imu_topic = sys.argv[1], sys.argv[2]
-typestore = get_typestore(Stores.ROS2_HUMBLE)
-cam_ts, imu_ts, cam_topic = [], [], None
-with Reader(bag_path) as r:
-    for c in r.connections:
-        if 'image' in c.topic and cam_topic is None:
-            cam_topic = c.topic
-    if cam_topic is None:
-        print("0.009"); sys.exit(0)
-    for conn, t, raw in r.messages():
-        if conn.topic == cam_topic and len(cam_ts) < 300:
-            msg = typestore.deserialize_cdr(raw, conn.msgtype)
-            cam_ts.append(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec)
-        elif conn.topic == imu_topic and len(imu_ts) < 10000:
-            msg = typestore.deserialize_cdr(raw, conn.msgtype)
-            imu_ts.append(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec)
-if len(cam_ts) < 10 or len(imu_ts) < 10:
-    print("0.009"); sys.exit(0)
-cam_ts = np.array(sorted(cam_ts))
-imu_ts = np.array(sorted(imu_ts))
-diffs = [(imu_ts[np.searchsorted(imu_ts, ct)] - ct) / 1e9
-         for ct in cam_ts if np.searchsorted(imu_ts, ct) < len(imu_ts)]
-est = float(np.median(diffs)) if diffs else 0.009
-print(f"{max(-0.1, min(0.1, est)):.6f}")
-PYEOF
-        )
-        echo "  → 추정된 timeshift prior: $(python3 -c "print(f'{float(\"$_timeshift_s\")*1000:.2f}ms')")"
-    fi
 
     # 원본 aprilgrid yaml에서 tagCols, tagRows, tagSpacing 읽기
     _april_params=$(python3 -c "
@@ -627,59 +725,24 @@ SWEEP_APRIL
         echo "tagSize = ${MM}mm (${TAGSIZE}m)"
         echo "=========================================="
 
-        # Kalibr 패치 파일 생성 (kalibr 모드와 동일한 패치)
-        cat > "$workdir/kalibr_patch.py" << PATCH_HEAD
-ts = ${_timeshift_s}
-apply_border = ${_apply_border}
-PATCH_HEAD
-        cat >> "$workdir/kalibr_patch.py" << 'PATCH_BODY'
-path = '/catkin_ws/src/kalibr/aslam_offline_calibration/kalibr/python/kalibr_imu_camera_calibration/IccSensors.py'
-with open(path) as f:
-    code = f.read()
-if apply_border:
-    code = code.replace(
-        'options.showExtractionVideo = showExtraction\n            options.minTagsForValidObs',
-        'options.showExtractionVideo = showExtraction\n            options.blackTagBorder = 1\n            options.minTagsForValidObs')
-    print('patched blackTagBorder=1')
-code = code.replace(
-    '        self.timeshiftCamToImuPrior = shift\n        \n',
-    '        self.timeshiftCamToImuPrior = shift\n        self.timeshiftCamToImuPrior = ' + str(ts) +
-    '\n        print("[PATCH] Timeshift prior: ' + str(round(ts * 1000, 2)) + 'ms")\n        \n')
-print(f'patched timeshiftCamToImuPrior={ts:.6f}s ({ts*1000:.2f}ms)')
-with open(path, 'w') as f:
-    f.write(code)
-PATCH_BODY
-
-        set +e
-        "$DOCKER" run --rm \
-            -v "$workdir":/data \
-            -v "$OUTPUT_DIR":/output \
-            -w /output \
-            --entrypoint bash \
-            -e KALIBR_MANUAL_FOCAL_LENGTH_INIT=1 \
-            kalibr:ros1 \
-            -c "export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1 && \
-                source /catkin_ws/devel/setup.bash && \
-                python3 /data/kalibr_patch.py && \
-                /catkin_ws/devel/lib/kalibr/kalibr_calibrate_imu_camera \
-                  --bag /data/vio_ros1.bag \
-                  --target /data/april_sweep_${MM}mm.yaml \
-                  --cam /data/$camchain_file \
-                  --imu /data/imu.yaml \
-                  --timeoffset-padding $timeoffset_padding \
-                  \
-                2>&1" | tee "$OUTPUT_DIR/kalibr.log"
-        set -e
+        # 패치(테두리·배치·시간차·관문)는 kalibr 모드와 같은 lib/kalibr_patch.py
+        run_kalibr_imucam "april_sweep_${MM}mm.yaml" "$OUTPUT_DIR/kalibr.log"
 
         # reprojection error 추출 (trailing comma 제거)
         CAM0=$(grep "Reprojection error (cam0) \[px\]" "$OUTPUT_DIR/kalibr.log" 2>/dev/null | awk '{print $6}' | tail -1 | tr -d ',')
         CAM1=$(grep "Reprojection error (cam1) \[px\]" "$OUTPUT_DIR/kalibr.log" 2>/dev/null | awk '{print $6}' | tail -1 | tr -d ',')
 
+        if [ "$kalibr_rc" = "4" ]; then
+            # 최적화 전 관문에서 멈춤 — 로그의 재투영은 최적화 전 값이라 최솟값 비교에서 뺀다
+            CAM0="관문(>${KALIBR_GATE_PX}px)"; CAM1="관문(>${KALIBR_GATE_PX}px)"
+        elif grep -a -q "Spline Coefficient Buffer Exceeded" "$OUTPUT_DIR/kalibr.log"; then
+            CAM0="시간차범위초과"; CAM1="시간차범위초과"; kalibr_rc=6
+        fi
         printf "%-12s | %-16s | %-16s\n" "${MM}mm" "${CAM0:-N/A}" "${CAM1:-N/A}" >> "$RESULTS_FILE"
         echo ">>> tagSize ${MM}mm: cam0=${CAM0:-N/A}px, cam1=${CAM1:-N/A}px"
 
         # 최솟값 추적 (cam0 기준)
-        if [ -n "$CAM0" ] && [ "$CAM0" != "N/A" ]; then
+        if [ -n "$CAM0" ] && [ "$CAM0" != "N/A" ] && [ "$kalibr_rc" != "4" ] && [ "$kalibr_rc" != "6" ]; then
             IS_BETTER=$(python3 -c "print('yes' if float('${CAM0}') < float('${BEST_ERR}') else 'no')" 2>/dev/null || echo "no")
             if [ "$IS_BETTER" = "yes" ]; then
                 BEST_ERR="$CAM0"
@@ -687,7 +750,7 @@ PATCH_BODY
             fi
         fi
 
-        rm -f "$APRIL_YAML" "$workdir/kalibr_patch.py"
+        rm -f "$APRIL_YAML"
     done
 
     echo ""
@@ -705,7 +768,7 @@ PATCH_BODY
     fi
     echo "상세 로그: $workdir/output/sweep_*mm/kalibr.log"
 
-    rm -f "$ros1_vio"
+    if [ "$ros1_cleanup" = "1" ]; then rm -f "$ros1_vio"; fi
     [ "$april_abs" != "$workdir/$april_base" ] && rm -f "$workdir/$april_base"
     exit 0
 fi

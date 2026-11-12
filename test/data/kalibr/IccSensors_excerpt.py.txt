@@ -1,0 +1,50 @@
+# Kalibr IccSensors.py 발췌(시험용, 원본 b7f469c 의 13~18·40~66·97~106·270~275행) — 패치 기준 문장이 그대로 있는지만 본다
+import cv2
+import sys
+import math
+import numpy as np
+import pylab as pl
+import scipy.optimize
+#mono camera
+class IccCamera():
+    def __init__(self, camConfig, targetConfig, dataset, reprojectionSigma=1.0, showCorners=True, \
+                 showReproj=True, showOneStep=False):
+        
+        #store the configuration
+        self.dataset = dataset
+        self.camConfig = camConfig
+        self.targetConfig = targetConfig
+        
+        # Corner uncertainty
+        self.cornerUncertainty = reprojectionSigma
+
+        #set the extrinsic prior to default
+        self.T_extrinsic = sm.Transformation()
+         
+        #initialize timeshift prior to zero
+        self.timeshiftCamToImuPrior = 0.0
+        
+        #initialize the camera data
+        self.camera = kc.AslamCamera.fromParameters( camConfig )
+        
+        #extract corners
+        self.setupCalibrationTarget( targetConfig, showExtraction=showCorners, showReproj=showReproj, imageStepping=showOneStep )
+        multithreading = not (showCorners or showReproj or showOneStep)
+        self.targetObservations = kc.extractCornersFromDataset(self.dataset, self.detector, multithreading=multithreading)
+        
+        elif targetType == 'aprilgrid':
+            options = acv_april.AprilgridOptions() 
+            options.showExtractionVideo = showExtraction
+            options.minTagsForValidObs = int( np.max( [targetParams['tagRows'], targetParams['tagCols']] ) + 1 )
+            
+            grid = acv_april.GridCalibrationTargetAprilgrid(targetParams['tagRows'],
+                                                            targetParams['tagCols'], 
+                                                            targetParams['tagSize'], 
+                                                            targetParams['tagSpacing'], 
+                                                            options)
+        #store the timeshift (t_imu = t_cam + timeshiftCamToImuPrior)
+        self.timeshiftCamToImuPrior = shift
+        
+        print("  Time shift camera to imu (t_imu = t_cam + shift):")
+        print(self.timeshiftCamToImuPrior)
+        

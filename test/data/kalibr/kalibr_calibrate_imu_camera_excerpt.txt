@@ -1,0 +1,12 @@
+# Kalibr kalibr_calibrate_imu_camera 발췌(시험용, 원본 b7f469c 의 200~210행)
+                      verbose = parsed.verbose)
+
+    print("")
+    print("Before Optimization")
+    print("===================")
+    util.printErrorStatistics(iCal)
+    
+    print("")
+    print("Optimizing...")
+    iCal.optimize(maxIterations=parsed.max_iter, recoverCov=parsed.recover_cov)
+

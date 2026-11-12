@@ -51,13 +51,43 @@ cd viso_inertial_calib
 >   - all: IMU 정지 bag·카메라 bag·VIO bag 이 모두 필요하고 allan 을 다시 돈다. 로봇에서는 `MODE=allan` 으로 imu.yaml 만 만들고, PC 에서는 `MODE=kalibr` 로 이어 가면 된다.
 > - 결과는 실행 폴더와 함께 **`$EDIE_CALIB_DIR`(기본: root·edieOS 면 `/var/lib/edie/data/calib`, 그 밖은 `~/.edie/calib` — 규칙 `lib/calib_dir.sh`, 시험은 `bash test/test_calib_dir.sh` 로 직접 돌린다 — colcon 패키지가 아니라 자동으로 돌지 않음)** 에도 복사된다. 모드마다 이번 실행에서 만들거나 쓴 것만 복사한다.
 >   - allan: `imu.yaml`
->   - kalibr: `imu.yaml`·`$CAMCHAIN_FILE`(기본 `camchain.yaml`)·이번 실행이 만든 `<bag>-camchain-imucam.yaml`·`<bag>-results-imucam.txt`·`<bag>-imu.yaml`
+>   - kalibr: `imu.yaml`·`$CAMCHAIN_FILE`(기본 `camchain.yaml`)·`kalibr_quality.txt`·이번 실행이 만든 `<bag>-camchain-imucam.yaml`·`<bag>-results-imucam.txt`·`<bag>-imu.yaml` — 단 결과 요약이 FAIL 이면 아무것도 게시하지 않는다(아래 "Kalibr 단계 점검")
 >   - all: `imu.yaml`·`camchain.yaml`·위 Kalibr 결과
 >   - sweep: 복사하지 않음(탐색용)
 >   - 결과를 쓰는 쪽(VINS 설정 등)은 `<bag>-camchain-imucam.yaml`(내부 파라미터 + T_cam_imu 포함)을 기준으로 읽는다. `$CAMCHAIN_FILE` 은 자기 이름 그대로 복사되므로 예전 `camchain.yaml` 과 함께 있을 수 있다.
 >   - kalibr·all 에서 이번 실행이 만든 Kalibr 결과가 없으면 오류로 끝난다.
 > - allan 파라미터는 실행할 때 `output/allan_params.yaml` 로 새로 만든다(저장소의 `external/allan_ros2/config/config.yaml` 은 건드리지 않는다).
 > - `external/kalibr` 는 ROS1(catkin) 이라 `COLCON_IGNORE` 로 colcon 전체 빌드에서 빠진다(Docker 이미지 안에서만 catkin 으로 빌드). 같은 포크의 `.dockerignore` 가 이 표식을 이미지에 넣지 않는다 — catkin 도 COLCON_IGNORE 를 무시 표식으로 보기 때문(SW1-1951).
+
+#### Kalibr 단계 점검 (EDIE, kalibr·sweep 모드)
+
+**왜 있나 (2026-11-12 .224 사고).** 보드 그림 방향이 Kalibr 가 기대하는 방향과 다르면, Kalibr 검출기가 태그마다 네 모서리 번호를 엇갈려 붙인다(퍼즐 조각을 돌려 끼운 꼴). 태그 번호는 맞아서 검출은 다 되는데, 장마다 카메라 자세가 틀려 재투영 49 px 로 발산했다. 그래도 Kalibr 는 결과를 다 쓰고 끝났다. 어긋나는 방식은 녹화마다 달랐다(.224 녹화는 180°, 옛 녹화는 좌우 뒤집기). 그래서 고정 패치 대신 매번 점검해서 고른다.
+
+1. **모서리 배치 자동 점검(본계산 전).** Kalibr 검출기 그대로 프레임 약 20장(녹화 전체에 고르게, 태그가 많이 보이는 장)에서 모서리를 뽑는다. 태그 안 배치 8가지(회전 4 × 뒤집기 2)마다 장별 PnP 재투영을 재서 표로 보여 준다(`output/kalibr_layout_check.txt`). 1등이 **2 px 미만**이고 2등과 **10배 넘게** 차이 나면 그 배치를 카메라마다 채택한다(그대로면 패치 없음). 본계산에서는 검출만 한 뒤 모서리를 다시 붙이고, 바른 배치로 자세를 구한 뒤에 Kalibr 와 같은 규칙(평균+2σ 초과이면서 0.2 px 초과)으로 이상치 모서리를 거른다. 그래도 평균 10 px 넘는 장(잘못 검출된 장)은 뺀다.
+   - **멈췄을 때(종료 코드 3):** 보드 yaml 의 `tagSize`(검은 사각형 한 변, m)·`tagSpacing`(간격÷태그 크기)·`tagRows/tagCols`(번호 배치), 테두리 답(표준 AprilTag = 1칸, Kalibr 로 만든 보드 = 2칸), camchain(내부값·왜곡·토픽·해상도가 이 녹화 카메라 것인지)을 확인한다.
+2. **발산 관문.** Kalibr 가 "Before Optimization" 에 찍는 카메라별 재투영 평균이 **5 px** 를 넘으면 최적화로 가지 않고 멈춘다(종료 코드 4).
+3. **결과 요약(PASS/WARN/FAIL).** 끝나면 `<bag>-results-imucam.txt` 를 읽어 `kalibr_quality.txt` 로 한 화면 요약을 남긴다. FAIL 이면 장비 보정 자리(`$EDIE_CALIB_DIR`)로 게시하지 않는다(종료 코드 5). 성공 여부는 Kalibr 종료 코드가 아니라 "이번 실행의 결과 파일 + 이 요약"으로 판단한다(보고서 창은 `--dont-show-report`·`MPLBACKEND=Agg` 로 띄우지 않는다).
+
+| 항목 | PASS | WARN | FAIL |
+|---|---|---|---|
+| 카메라별 재투영 평균 | < 2 px | 2~5 px | ≥ 5 px |
+| 자이로·가속도 정규화 잔차 평균(잡음값으로 나눈 오차, 1 근처가 정상) | 0.3~3 | 0.3 미만, 3~10 | > 10 |
+| 카메라끼리 시간차 차이 | < 3 ms | 3~10 ms | ≥ 10 ms |
+| 기준 대비 회전 / 카메라 위치(기준을 줄 때만) | < 3° / < 3 cm | 그 이상 | (없음 — 기준값이 틀렸을 수 있다) |
+
+문턱은 모두 **임시값**이다(.224 성공·발산, 옛 결과 세 개로만 정함). 기준값은 `KALIBR_REF_CAMCHAIN=<T_cam_imu 가 든 camchain yaml>` 로 주거나, 입력 camchain 에 `T_cam_imu` 가 있으면 그것을 쓴다.
+
+**시간차 인자(7번째, ms).** `auto`(기본)는 Kalibr 자체 추정(카메라 자세에서 구한 각속도 크기와 자이로 크기의 교차상관)을 그대로 쓴다. 숫자를 주면 그 값으로 시작한다. 롤링셔터 카메라는 화면 가운데 줄 기준 시각이라 약 **+읽기시간/2** 가 더해진다(.224: 노출 지연 3.2 + 읽기 64.4/2 ≈ 35 ms). 최적화 중에는 시작값에서 ±50 ms(padding) 안에서만 움직인다.
+- **롤링셔터 카메라는 `auto` 가 크게 빗나갈 수 있다.** .224 실측: Kalibr 추정 −18.5 ms, 바른 값 약 +35 ms → 53 ms 차이로 범위를 벗어나 Kalibr 가 "Spline Coefficient Buffer Exceeded" 로 죽었다. pipeline 은 이때 **종료 코드 6** 과 함께 숫자를 주라고 안내한다. 롤링셔터 카메라는 처음부터 숫자를 주는 것이 안전하다(예: `... kalibr /edie/sensor/offset_imu 35`).
+- 옛 판의 `auto`(영상 직후 IMU stamp 까지 간격의 중앙값 → 1~2 ms)는 카메라–IMU 시간차가 아니라 지웠다. 옛 판이 Kalibr 추정(그때 50 ms)을 9 ms 등으로 덮어쓴 이유도 같은 "버퍼 초과"였다(git 4f5fb54 주석 — 그때는 모서리 배치도 틀린 상태였다).
+
+**환경변수.**
+- `KALIBR_TAG_BORDER=1|2` — 테두리 질문("표준 AprilTag36h11 입니까?")을 생략(1 = 표준 AprilTag 1칸, 2 = Kalibr 보드 2칸).
+- `KALIBR_CORNER_LAYOUT=auto|identity|rot90|rot180|rot270|flip_lr|flip_ud|transpose|antitranspose` — `auto`(기본)가 아니면 점검 없이 그 배치를 모든 카메라에 강제(`identity` = 점검을 끈 옛 동작).
+- `KALIBR_CHECK_ONLY=1` — 배치 점검만 하고 끝. `KALIBR_CHECK_FRAMES`(기본 20), `KALIBR_GATE_PX`(기본 5).
+- VIO bag 이 ROS1 `.bag` 파일이면 변환하지 않고 하드링크(복사 아님)로 쓴다.
+- 종료 코드: 0 성공(PASS·WARN, 게시함), 1 일반 오류, 3 배치 점검에서 멈춤, 4 최적화 전 관문, 5 결과 요약 FAIL(게시 안 함), 6 시간차 범위 초과.
+- 시험: `python3 test/test_kalibr_tools.py`(배치 식·선택 규칙·요약 판정·패치), `bash test/test_pipeline_kalibr_flow.sh`(가짜 docker 로 종료 코드·게시 여부). Docker 없이 돈다.
 
 ### 2. Prepare Your Data
 
