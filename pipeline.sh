@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -e
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 셔터 종류에 따라 달라지는 것은 7번째 인자(시간차 시작값) 하나뿐이다. 나머지 인자·설정은 같다.
+#
+#   글로벌 셔터(화면 전체를 한순간에 찍음)  → 7번째 인자 생략 또는 auto
+#       Kalibr 가 스스로 추정한다. 옛 카메라 녹화는 auto 로 9.1 ms 가 나왔다(11-12 재계산).
+#   롤링 셔터(위에서 아래로 한 줄씩 찍음)   → 7번째 인자에 숫자(ms)를 꼭 준다
+#       값 = "영상 stamp → 첫 줄" 시간 + 읽기 시간 / 2   (화면 가운데 줄이 찍힌 순간)
+#       로봇 .224 새 카메라: 3.2 + 64.4 / 2 ≈ 35  → ... kalibr /edie/sensor/offset_imu 35
+#       auto 로 두면 Kalibr 추정이 크게 빗나가(.224 실측 −18.5 ms) 탐색 범위를 벗어나 종료 코드 6 으로 멈춘다.
+#
+# 왜 이것뿐인가: Kalibr 의 카메라–IMU 계산에는 롤링 셔터 모델이 없다(셔터 종류를 넘길 인자가 없다).
+#   그래서 롤링 셔터는 "화면 가운데 줄 시각"을 영상 시각으로 보는 근사로 풀고, 그 차이가 시간차로 나타난다.
+#   남는 오차를 줄이려면 녹화할 때 천천히 움직인다(빠를수록 보드가 휘어 찍힌다).
+#   카메라 종류·읽기 시간은 edie_vision config/gstreamer/camera_v4l2.yaml 의 shutter_type·rolling_shutter 에 있다.
+# ─────────────────────────────────────────────────────────────────────────────
+
 if [ "$#" -lt 4 ] || [ "$#" -gt 7 ]; then
   echo "Usage: $0 BAG_IMU BAG_CAM BAG_VIO APRILGRID_YAML [MODE] [IMU_TOPIC] [TIMESHIFT_MS|auto]" >&2
   echo "  MODE: all (default) | allan | kalibr | sweep" >&2
@@ -8,6 +24,9 @@ if [ "$#" -lt 4 ] || [ "$#" -gt 7 ]; then
   echo "  TIMESHIFT_MS: 카메라→IMU 시간차 시작값(ms). auto(기본) = Kalibr 자체 추정(각속도 크기 교차상관)" >&2
   echo "          롤링셔터 카메라는 화면 가운데 줄 기준이라 약 +읽기시간/2 가 더해진다(.224: 약 35 ms)." >&2
   echo "          롤링셔터면 auto 가 크게 빗나가 멈출 수 있다(.224 실측 −18.5 ms → 종료 코드 6) — 숫자로 주자" >&2
+  echo "  셔터 종류별 7번째 인자(다른 인자는 같다):" >&2
+  echo "          글로벌 셔터 → 생략 또는 auto" >&2
+  echo "          롤링 셔터   → 숫자(ms) = stamp→첫 줄 시간 + 읽기 시간/2   (.224: 3.2 + 64.4/2 ≈ 35)" >&2
   echo "  kalibr: allan 스킵, 기존 imu.yaml+camchain.yaml 사용, VIO 캘립만 실행" >&2
   echo "          BAG_IMU, BAG_CAM 은 '-' 로 생략 가능. BAG_VIO 가 ROS1 .bag 파일이면 변환 없이 그대로 쓴다" >&2
   echo "          본계산 전 모서리 배치 자동 점검(멈추면 종료 코드 3), 최적화 전 재투영 관문(종료 코드 4)," >&2
@@ -19,7 +38,7 @@ if [ "$#" -lt 4 ] || [ "$#" -gt 7 ]; then
   echo "Example: $0 imu_stationary.bag camera_intrinsics.bag vio_calibration.bag aprilgrid.yaml allan" >&2
   echo "Example: $0 imu_stationary.bag - - aprilgrid.yaml allan /edie/sensor/offset_imu" >&2
   echo "Example: $0 - - vio_calibration.bag aprilgrid.yaml kalibr" >&2
-  echo "Example: $0 - - vio_calibration.bag aprilgrid.yaml kalibr /edie/sensor/offset_imu 9" >&2
+  echo "Example: $0 - - vio_calibration.bag aprilgrid.yaml kalibr /edie/sensor/offset_imu 35   # 롤링 셔터(.224)" >&2
   echo "Example: $0 - - vio_calibration.bag aprilgrid.yaml sweep" >&2
   exit 1
 fi
@@ -230,6 +249,7 @@ choose_timeshift() {
     if [ "$timeshift_arg" = "auto" ]; then
         _ts_patch=auto
         echo "시간차 시작값: Kalibr 자체 추정(카메라·자이로 각속도 크기 교차상관). 숫자로 직접 줄 수도 있음(7번째 인자, ms)"
+        echo "  ※ 롤링 셔터 카메라라면 auto 대신 숫자를 주세요(stamp→첫 줄 + 읽기 시간/2, .224 는 35). 글로벌 셔터는 auto 그대로 됩니다."
     elif [[ "$timeshift_arg" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
         _ts_patch=$timeshift_arg
         echo "시간차 시작값: ${timeshift_arg} ms (직접 지정)"
